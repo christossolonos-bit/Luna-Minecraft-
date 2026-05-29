@@ -1,0 +1,27 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="luna_companion_bridge"
+version="0.1.0"
+displayName="Luna Companion Bridge"
+authors="Luna"
+description='''
+Connects your local Minecraft world to the Luna Companion SDK over WebSocket.
+Works with CurseForge Forge profiles for Minecraft 1.20.1.
+'''
+
+[[dependencies.minecraft]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1,1.20.2)"
+ordering="NONE"
+side="CLIENT"
+
+[[dependencies.forge]]
+modId="forge"
+mandatory=true
+versionRange="[47,)"
+ordering="NONE"
+side="CLIENT"

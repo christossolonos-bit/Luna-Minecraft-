@@ -1,0 +1,10 @@
+{
+  "enable": true,
+  "loadlist": [
+    {
+      "name": "LunaLocalSkin",
+      "type": "CustomSkinAPI",
+      "root": "LocalSkin/skins/{USER_NAME}.png"
+    }
+  ]
+}

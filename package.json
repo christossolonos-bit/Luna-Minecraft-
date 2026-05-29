@@ -1,0 +1,46 @@
+{
+  "name": "minecraft-companion-sdk",
+  "version": "0.1.0",
+  "description": "Local-first SDK for AI companion control and Minecraft state awareness.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/server.ts",
+    "companion": "tsx src/companion.ts",
+    "luna": "tsx src/launch-luna.ts",
+    "observe": "tsx examples/observe.ts",
+    "luna:ai": "tsx examples/luna-ai.ts",
+    "install:voice": "pip install -r requirements-voice.txt",
+    "install:client": "powershell -ExecutionPolicy Bypass -File scripts/install-luna-client.ps1",
+    "start": "node dist/server.js",
+    "lint": "tsc --noEmit",
+    "build:mod": "cd forge-bridge && gradlew.bat build --no-daemon"
+  },
+  "keywords": [
+    "minecraft",
+    "sdk",
+    "ai",
+    "companion"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "edge-tts-universal": "^1.4.0",
+    "minecraft-data": "^3.110.2",
+    "mineflayer": "^4.37.0",
+    "mineflayer-collectblock": "^1.6.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "mineflayer-tool": "^1.2.0",
+    "vec3": "^0.1.10",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

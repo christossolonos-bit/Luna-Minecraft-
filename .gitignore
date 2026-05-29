@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.cache/
+*.log
+__pycache__/
+*.pyc
+data/*.json
+
+forge-bridge/.gradle/
+forge-bridge/build/
+forge-bridge/run/
+forge-bridge/.idea/
+forge-bridge/out/
