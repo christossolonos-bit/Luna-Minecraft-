@@ -1,14 +1,54 @@
+# Dependencies
 node_modules/
-dist/
-.env
-.cache/
-*.log
-__pycache__/
-*.pyc
-data/*.json
 
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment & secrets (never commit)
+.env
+.env.local
+.env.*.local
+
+# Logs & caches
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.cache/
+.npm/
+
+# Python (voice scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+
+# Luna runtime learning data (local per machine)
+data/*.json
+!data/.gitkeep
+
+# IDE / editor
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Cursor / VS Code (keep shared launch config if you want — uncomment next line to ignore all)
+# .vscode/
+
+# Gradle / Forge mod build (optional mod subproject)
 forge-bridge/.gradle/
 forge-bridge/build/
 forge-bridge/run/
-forge-bridge/.idea/
 forge-bridge/out/
+
+# OS & temp
+*.tmp
+*.temp
