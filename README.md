@@ -1,4 +1,10 @@
-# Minecraft Companion SDK (Mineflayer)
+# Luna Minecraft
+
+Luna is an AI companion bot that can interact with you in Minecraft and learn to gather, craft, build, and fight over time.
+
+Repository: [christossolonos-bit/Luna-Minecraft-](https://github.com/christossolonos-bit/Luna-Minecraft-)
+
+## Minecraft Companion SDK (Mineflayer)
 
 Control a Minecraft companion bot and stream live state to your AI over a local WebSocket bridge.
 
