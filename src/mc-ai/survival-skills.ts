@@ -6,6 +6,7 @@ import { McTurnResult, resolveActions, TaskIntent } from "./actions";
 import { isFoodItem } from "../bot-eat";
 import { GameplayRL } from "./reinforcement";
 import { recommendProcessStep } from "./craft-knowledge";
+import { plannerGoalBonus } from "./survival-planner";
 
 export type SurvivalSkillId =
   | "wood_gathering"
@@ -285,6 +286,27 @@ export class SurvivalSkills {
     saveMemory(this.mem);
   }
 
+  applyOwnerFeedback(goal: SurvivalGoal, positive: boolean, note: string): void {
+    const skillId = GOAL_TO_SKILL[goal];
+    if (!skillId || !this.mem.skills[skillId]) {
+      return;
+    }
+    const s = this.mem.skills[skillId]!;
+    s.ownerInfluence += positive ? 3 : -3;
+    s.lastUsed = Date.now();
+    if (positive) {
+      s.successes += 1;
+    } else {
+      s.failures += 1;
+    }
+    const line = note.slice(0, 100);
+    this.mem.notes.push(line);
+    while (this.mem.notes.length > MAX_NOTES) {
+      this.mem.notes.shift();
+    }
+    saveMemory(this.mem);
+  }
+
   recordTask(task: string, ok: boolean, detail?: string): void {
     const map: Record<string, SurvivalGoal> = {
       gather_wood: "gather_wood",
@@ -358,9 +380,10 @@ export class SurvivalSkills {
     const add = (goal: SurvivalGoal, base: number) => {
       const rlBoost = this.rl?.goalBias(goal) ?? 0;
       const rlPen = this.rl?.goalPenalty(goal) ?? 0;
+      const planBoost = plannerGoalBonus(state, goal);
       candidates.push({
         goal,
-        score: base + (boosts[goal] ?? 0) + skillAffinity(goal) + rlBoost - rlPen
+        score: base + (boosts[goal] ?? 0) + skillAffinity(goal) + rlBoost - rlPen + planBoost
       });
     };
 

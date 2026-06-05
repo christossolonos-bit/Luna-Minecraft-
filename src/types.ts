@@ -77,6 +77,10 @@ export type CompanionState = {
   nearbyStructures?: NearbyStructure[];
   /** e.g. "facing north" */
   facingLabel?: string;
+  /** Owner (MC_OWNER) is in a bed */
+  ownerSleeping?: boolean;
+  /** Luna is in a bed */
+  lunaSleeping?: boolean;
 };
 
 export type PlayerChatMessage = {
@@ -136,6 +140,10 @@ export type CompanionAction =
         | "craft_tools"
         | "craft_survival"
         | "deposit_chest"
+        | "take_tool"
+        | "check_logs"
+        | "collect_wheat"
+        | "plant_wheat"
         | "fight_mobs"
         | "hunt_animal";
       amount?: number;
@@ -162,4 +170,5 @@ export type ActionResult = {
   ok: boolean;
   action: CompanionAction["type"];
   reason?: string;
+  detail?: string;
 };

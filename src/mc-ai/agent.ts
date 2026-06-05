@@ -2,7 +2,16 @@ import { CompanionClient } from "../sdk";
 import { ActionResult, CompanionAction, CompanionState } from "../types";
 import { McBrain, chunkChat } from "./brain";
 import { loadMcAiConfig } from "./config";
-import { checkOllamaHealth } from "./ollama";
+import { checkOllamaHealth, isBrokenOllamaContent } from "./ollama";
+import { mergeNaturalLanguageIntoTurn, parseNaturalLanguageTurn } from "./conversation-intent";
+import { OwnerFeedbackMemory, parseOwnerFeedback } from "./owner-feedback";
+import { survivalPlannerSummary } from "./survival-planner";
+import { parseOwnerTaskChain } from "./task-chains";
+import {
+  isCompanionSocialMessage,
+  polishCompanionSay,
+  resolveCompanionChatTurn
+} from "./companion-chat";
 import { AutonomousPlayer } from "./autonomous";
 import { GameplayRL, snapshotState } from "./reinforcement";
 import { AgentStatusTracker } from "./agent-status";
@@ -22,6 +31,7 @@ import {
   focusTurnOnUserIntent,
   hasActionableCommand,
   heuristicTurn,
+  heuristicVoiceSay,
   isTaskIntent,
   McTurnResult,
   ownerMoveTarget,
@@ -47,6 +57,25 @@ import {
 import { ActionRunner, createQueuedSender, UserCommandJob, UserCommandQueue } from "./sequential";
 
 export async function startMcAi(): Promise<void> {
+  const mode = (process.env.MC_AI_MODE ?? "simple").trim().toLowerCase();
+  const commands = (process.env.MC_AI_COMMANDS ?? "simple").trim().toLowerCase();
+  const { startSimpleLuna } = await import("../luna/simple-agent");
+
+  if (mode !== "full" && mode !== "advanced") {
+    return startSimpleLuna();
+  }
+
+  // full mode: written commands stay on the simple parser; LLM chat optional (MC_AI_CHAT_LLM=false)
+  if (commands !== "advanced") {
+    const enableLlmChat = process.env.MC_AI_CHAT_LLM !== "false";
+    return startSimpleLuna({ enableLlmChat });
+  }
+
+  return startMcAiFull();
+}
+
+/** Full Luna: Ollama, voice, autonomous survival, RL, tutorials. */
+async function startMcAiFull(): Promise<void> {
   const config = loadMcAiConfig();
   const brain = new McBrain(config);
   const voiceFlags = voiceEnabledFromEnv();
@@ -80,6 +109,7 @@ export async function startMcAi(): Promise<void> {
   const observer = observeEnabled ? new CompanionObserver() : null;
   const gameplayRl = new GameplayRL();
   const survivalSkills = new SurvivalSkills(gameplayRl);
+  const ownerFeedback = new OwnerFeedbackMemory();
   const tutorialLearner = new TutorialLearner();
   const agentStatus = new AgentStatusTracker();
   const autonomous = new AutonomousPlayer(undefined, survivalSkills, gameplayRl);
@@ -176,6 +206,8 @@ export async function startMcAi(): Promise<void> {
     refreshSurvivalContext();
     brain.setTutorialSummary(tutorialLearner.summaryForPrompt());
     brain.setStatusSummary(latestState ? agentStatus.summaryForPrompt(latestState) : "");
+    brain.setOwnerFeedbackSummary(ownerFeedback.summaryForPrompt());
+    brain.setPlannerSummary(survivalPlannerSummary(latestState));
   }
 
   function refreshSurvivalContext(): void {
@@ -271,6 +303,9 @@ export async function startMcAi(): Promise<void> {
   }
 
   async function runAutonomousTick(state: CompanionState): Promise<void> {
+    if (state.ownerSleeping || state.lunaSleeping) {
+      return;
+    }
     if (
       autonomous.shouldPause({
         busy,
@@ -344,7 +379,12 @@ export async function startMcAi(): Promise<void> {
     });
     brain.setStatusSummary(agentStatus.summaryForPrompt(state));
 
-    if (shouldAutoEat(state) && hasFoodInInventory(state)) {
+    if (
+      !state.ownerSleeping &&
+      !state.lunaSleeping &&
+      shouldAutoEat(state) &&
+      hasFoodInInventory(state)
+    ) {
       const eatCooldown = Number(process.env.MC_AI_EAT_COOLDOWN_MS ?? "6000") || 6000;
       const urgent = state.player.health < 6;
       const now = Date.now();
@@ -391,6 +431,8 @@ export async function startMcAi(): Promise<void> {
 
     const hasSword = state.inventory?.some((i) => i.name.endsWith("_sword"));
     if (
+      !state.ownerSleeping &&
+      !state.lunaSleeping &&
       observer?.shouldAutoDefend(state) &&
       !busy &&
       !taskFocus &&
@@ -493,8 +535,13 @@ export async function startMcAi(): Promise<void> {
     }
   }
 
-  async function executeTurn(state: CompanionState | null, turn: McTurnResult, userMessage = ""): Promise<void> {
+  async function executeTurn(
+    state: CompanionState | null,
+    turn: McTurnResult,
+    userMessage = ""
+  ): Promise<boolean> {
     const focused = focusTurnOnUserIntent(turn, userMessage);
+    let allOk = true;
 
     if (focused.move === "follow_owner") {
       followOwner = true;
@@ -539,6 +586,7 @@ export async function startMcAi(): Promise<void> {
           snap = latestState ? snapshotState(latestState) : snap;
 
           if (!result.ok) {
+            allOk = false;
             console.log(`[task] ${action.type}: ${result.reason ?? "failed"}`);
             if (action.type === "run_task") {
               survivalSkills.recordTask(action.task, false, result.reason);
@@ -566,6 +614,7 @@ export async function startMcAi(): Promise<void> {
     } finally {
       taskFocus = false;
     }
+    return allOk;
   }
 
   async function processOwnerCommand(job: UserCommandJob): Promise<void> {
@@ -580,31 +629,108 @@ export async function startMcAi(): Promise<void> {
           : isBuild
             ? "Minecraft build"
             : "Minecraft chat";
-      let turn: McTurnResult;
-      const directOwner = resolveDirectOwnerQuestion(message, latestState);
-      const directSpatial = resolveSpatialAwarenessTurn(message, latestState);
-      const directHunt = resolveDirectHuntTurn(message, latestState);
-      const directCraft = resolveDirectCraftTurn(message, latestState);
-      if (directOwner) {
-        console.log("[owner] direct question — inventory/status (no LLM, no wiki)");
-        turn = focusTurnOnUserIntent(directOwner, message);
-      } else if (directSpatial) {
-        console.log(`[awareness] spatial cue → task ${directSpatial.task}`);
-        turn = focusTurnOnUserIntent(directSpatial, message);
-      } else if (directHunt) {
-        console.log(`[hunt] direct command: ${directHunt.taskTarget ?? "animal"}`);
-        turn = focusTurnOnUserIntent(directHunt, message);
-      } else if (directCraft) {
-        console.log(
-          `[craft] direct command: ${directCraft.craftItem ?? "materials check only"}`
+      let turn: McTurnResult | undefined;
+      const feedbackPolarity = parseOwnerFeedback(message);
+
+      if (feedbackPolarity) {
+        const { say, note } = ownerFeedback.applyFeedback(
+          feedbackPolarity,
+          gameplayRl,
+          survivalSkills
         );
-        turn = focusTurnOnUserIntent(directCraft, message);
-      } else {
+        console.log(`[feedback] ${feedbackPolarity}${note ? ` — ${note}` : ""}`);
+        turn = { say, move: "none", lookAt: "owner", task: "none" };
         refreshBrainContext();
-        turn = focusTurnOnUserIntent(
-          await brain.replyTurn(message, latestState, source),
-          message
-        );
+      } else {
+        const directOwner = resolveDirectOwnerQuestion(message, latestState);
+        const directSpatial = resolveSpatialAwarenessTurn(message, latestState);
+        const directHunt = resolveDirectHuntTurn(message, latestState);
+        const directCraft = resolveDirectCraftTurn(message, latestState);
+
+        if (directOwner) {
+          console.log("[owner] direct question — inventory/status (no LLM, no wiki)");
+          turn = focusTurnOnUserIntent(directOwner, message);
+        } else if (isCompanionSocialMessage(message)) {
+          const statusLine = latestState ? agentStatus.summaryForPrompt(latestState) : "";
+          console.log("[chat] companion reply (social / question)");
+          turn = focusTurnOnUserIntent(
+            resolveCompanionChatTurn(message, latestState, {
+              statusLine,
+              activity: statusLine
+            })!,
+            message
+          );
+        } else if (directSpatial) {
+          console.log(`[awareness] spatial cue → task ${directSpatial.task}`);
+          turn = focusTurnOnUserIntent(directSpatial, message);
+        } else if (directHunt) {
+          console.log(`[hunt] direct command: ${directHunt.taskTarget ?? "animal"}`);
+          turn = focusTurnOnUserIntent(directHunt, message);
+        } else if (directCraft) {
+          console.log(
+            `[craft] direct command: ${directCraft.craftItem ?? "materials check only"}`
+          );
+          turn = focusTurnOnUserIntent(directCraft, message);
+        } else {
+          const taskChain = parseOwnerTaskChain(message);
+          if (taskChain.length >= 2) {
+            console.log(`[chain] ${taskChain.join(" → ")}`);
+            turn = focusTurnOnUserIntent(
+              {
+                say: `Got you — I'll ${taskChain.join(", then ")}. One step at a time!`,
+                move: "none",
+                lookAt: "none",
+                task: taskChain[0]!
+              },
+              message
+            );
+          } else {
+            const learned =
+              !isCompanionSocialMessage(message) && ownerFeedback.matchLearnedPattern(message);
+            if (learned) {
+              console.log("[feedback] matched owner-approved phrase pattern");
+              turn = focusTurnOnUserIntent(learned, message);
+            } else {
+              const natural = parseNaturalLanguageTurn(message);
+              if (natural) {
+                console.log("[nl] parsed natural language intent");
+                turn = focusTurnOnUserIntent(natural, message);
+              } else if (
+                kind === "voice" &&
+                /\b(can you hear|hear me|you hear me|are you listening)\b/i.test(message)
+              ) {
+                console.log("[voice] hear-check — instant reply (no LLM)");
+                turn = focusTurnOnUserIntent(
+                  {
+                    say: heuristicVoiceSay(message),
+                    move: "none",
+                    lookAt: "owner",
+                    task: "none"
+                  },
+                  message
+                );
+              } else {
+                refreshBrainContext();
+                turn = focusTurnOnUserIntent(
+                  await brain.replyTurn(message, latestState, source),
+                  message
+                );
+                turn = mergeNaturalLanguageIntoTurn(turn, message);
+                if (isBrokenOllamaContent(turn.say)) {
+                  console.warn("[voice] LLM returned unusable text — using voice fallback");
+                  const nl = parseNaturalLanguageTurn(message);
+                  turn = {
+                    ...(nl
+                      ? focusTurnOnUserIntent(nl, message)
+                      : focusTurnOnUserIntent(heuristicTurn(message), message)),
+                    say: heuristicVoiceSay(message)
+                  };
+                }
+              }
+            }
+          }
+        }
+
         const craftItem = parseCraftItemRequest(message);
         if (craftItem) {
           const check = checkCraftMaterials(latestState, craftItem);
@@ -625,10 +751,14 @@ export async function startMcAi(): Promise<void> {
             craftItem: undefined
           };
         }
-        turn = applySpatialAwarenessToTurn(turn, message, latestState);
+        turn = applySpatialAwarenessToTurn(turn!, message, latestState);
       }
 
-      if (!isOwnerDirectQuestion(message)) {
+      if (!turn) {
+        return;
+      }
+
+      if (!feedbackPolarity && !isOwnerDirectQuestion(message)) {
         tutorialLearner.maybeStudyFromQuestion(
           message,
           config.ollamaHost,
@@ -639,9 +769,10 @@ export async function startMcAi(): Promise<void> {
 
       if (asksAboutInventory(message) && latestState?.inventorySummary) {
         turn = { ...turn, say: `I've got: ${latestState.inventorySummary}`, task: "none" };
-      } else if (!turn.say && hasActionableCommand(message, turn)) {
-        turn = { ...turn, say: "On it!" };
       }
+
+      const statusLine = latestState ? agentStatus.summaryForPrompt(latestState) : "";
+      turn = polishCompanionSay(turn, message, latestState, { statusLine, activity: statusLine });
 
       turn = stripConversationalActions(turn, message);
 
@@ -671,7 +802,10 @@ export async function startMcAi(): Promise<void> {
         console.log(`[inv] ${latestState.inventorySummary}`);
       }
 
-      await executeTurn(latestState, turn, message);
+      const actionOk = await executeTurn(latestState, turn, message);
+      if (!feedbackPolarity) {
+        ownerFeedback.setLastAction(message, turn, actionOk);
+      }
 
       await voice.speak(turn.say);
       for (const part of chunkChat(turn.say, config.mcChatLimit)) {

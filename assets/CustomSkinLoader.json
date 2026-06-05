@@ -5,6 +5,11 @@
       "name": "LunaLocalSkin",
       "type": "CustomSkinAPI",
       "root": "LocalSkin/skins/{USER_NAME}.png"
+    },
+    {
+      "name": "LunaBotFallback",
+      "type": "CustomSkinAPI",
+      "root": "LocalSkin/skins/Luna.png"
     }
   ]
 }

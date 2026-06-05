@@ -31,6 +31,12 @@ import {
 import { eatBestFood } from "./bot-eat";
 import { craftSpecificItem } from "./bot-craft";
 import { abortActiveMining, mineBlockReliably, pickaxeOrAxeForBlock } from "./bot-gather";
+import {
+  getSleepSyncState,
+  isSleepRoutineActive,
+  registerDefaultMovements,
+  setupOwnerBedSync
+} from "./bot-sleep";
 import { scanNearbyStructures, yawToCompassLabel } from "./spatial-awareness";
 import {
   ActionResult,
@@ -121,30 +127,36 @@ export async function startMineflayerGame(options: MineflayerGameOptions = {}): 
     | "slim"
     | "classic";
   const skinPath = resolveSkinPath();
-  const useMineSkin = process.env.MC_USE_MINESKIN === "true";
+  const mineSkinDisabled = process.env.MC_USE_MINESKIN === "false";
   let skinSession: LunaSkinSession | null = null;
 
-  if (useMineSkin && skinPath) {
+  if (skinPath && !mineSkinDisabled) {
     try {
       const profile = await loadSkinProfile(skinPath, skinModel);
       skinSession = buildSkinSession(username, profile);
-      console.log(`[bot] MineSkin profile loaded from ${skinPath} (${skinModel}).`);
+      console.log(`[bot] MineSkin skin active for "${username}" (${skinModel}) — visible to all players in LAN.`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.warn(`[bot] MineSkin upload failed: ${message}`);
+      console.warn("[bot] Falling back to offline login + CustomSkinLoader on your Minecraft client.");
     }
-  } else if (skinPath) {
+  }
+  if (!skinSession && skinPath) {
     console.log(
-      `[bot] Using offline login. Luna's look comes from CustomSkinLoader (LocalSkin/skins/Luna.png).`
+      `[bot] Offline login — run scripts\\setup-luna-skin.ps1 and use CustomSkinLoader in your launcher (or set MC_USE_MINESKIN=true).`
     );
-  } else {
+  } else if (!skinPath) {
     console.warn("[bot] No Luna skin file found. Set MC_SKIN_PATH or add assets/skins/luna.png");
   }
 
   const connectBot = (): Promise<Bot> =>
     new Promise((resolve, reject) => {
-      console.log(`[bot] Connecting to ${host}:${port} as "${username}"...`);
+      const versionLabel = version?.trim() || "auto-detect from server";
+      console.log(`[bot] Connecting to ${host}:${port} as "${username}" (MC ${versionLabel})...`);
       console.log("[bot] In Minecraft: Esc → Open to LAN (then this bot can join).");
+      if (version && version !== "1.21.1") {
+        console.warn(`[bot] MC_VERSION=${version} — set to 1.21.1 if that is your Open to LAN version (F3 screen).`);
+      }
 
       const bot = mineflayer.createBot({
         host,
@@ -192,7 +204,11 @@ export async function startMineflayerGame(options: MineflayerGameOptions = {}): 
             "[bot] Windows ran out of network buffers — Luna will wait longer before retrying. Close extra Luna/terminal windows."
           );
         } else if (msg.includes("unsupported protocol") || msg.includes("ECONNREFUSED")) {
-          console.warn("[bot] Check: world is Open to LAN, MC_PORT matches, MC_VERSION matches F3 screen.");
+          console.warn("[bot] Check: world is Open to LAN, MC_PORT matches, MC_VERSION=1.21.1 matches F3 screen.");
+        } else if (/PartialReadError|SlotComponent/i.test(msg)) {
+          console.warn(
+            "[bot] Chest/inventory packet error — confirm MC_VERSION=1.21.1 and avoid modded LAN if chests fail."
+          );
         }
       });
       bot.on("kicked", (reason) => {
@@ -222,12 +238,14 @@ export async function startMineflayerGame(options: MineflayerGameOptions = {}): 
     movements.canDig = true;
     movements.allowSprinting = true;
     bot.pathfinder.setMovements(movements);
+    registerDefaultMovements(bot, movements);
 
     const bridge = await connectBridge(bridgeUrl);
     trackBuildEvents(bot, buildEvents, username, ownerUsername);
     if (ownerUsername) {
       trackOwnerActivity(bot, ownerActivity, username, ownerUsername);
       setupRespawnNearOwner(bot, ownerUsername);
+      setupOwnerBedSync(bot, ownerUsername);
     }
 
     if (ownerUsername) {
@@ -388,6 +406,22 @@ async function executeAction(
   buildEvents: BuildEvent[],
   ownerUsername?: string
 ): Promise<{ ok: boolean; action: string; reason?: string }> {
+  if (
+    isSleepRoutineActive() &&
+    action.type !== "stop_all" &&
+    action.type !== "chat" &&
+    (action.type === "run_task" ||
+      action.type === "mine_block" ||
+      action.type === "move_to" ||
+      action.type === "place_block")
+  ) {
+    return {
+      ok: false,
+      action: action.type,
+      reason: "paused — owner is sleeping"
+    };
+  }
+
   try {
     switch (action.type) {
       case "move_to":
@@ -482,7 +516,8 @@ async function runTask(
   return {
     ok: result.ok,
     action: "run_task",
-    reason: result.reason ?? result.detail
+    reason: result.reason ?? result.detail,
+    detail: result.detail
   };
 }
 
@@ -490,6 +525,16 @@ async function moveTo(
   bot: Bot,
   action: Extract<CompanionAction, { type: "move_to" }>
 ): Promise<ActionResult> {
+  const botWithMoves = bot as Bot & { _lunaDefaultMovements?: Movements };
+  const prevMovements = botWithMoves._lunaDefaultMovements;
+  const safeMove = new Movements(bot);
+  safeMove.canDig = false;
+  safeMove.allow1by1towers = false;
+  safeMove.allowSprinting = true;
+  // Prevent scaffold placement while following/coming.
+  safeMove.scafoldingBlocks = [];
+  bot.pathfinder.setMovements(safeMove);
+
   const GoalBlock = goals.GoalBlock;
   bot.pathfinder.setGoal(
     new GoalBlock(
@@ -505,6 +550,10 @@ async function moveTo(
   } catch {
     bot.pathfinder.setGoal(null);
     return { ok: false, action: "move_to", reason: "stuck: pathfinding timed out" };
+  } finally {
+    if (prevMovements) {
+      bot.pathfinder.setMovements(prevMovements);
+    }
   }
 }
 
@@ -525,6 +574,9 @@ async function mineBlock(
   const block = bot.blockAt(vecToBlockPos(action.target));
   if (!block || block.name === "air") {
     return { ok: false, action: "mine_block", reason: "No block at target." };
+  }
+  if (block.name.endsWith("_bed") || block.name === "bed") {
+    return { ok: false, action: "mine_block", reason: "will not break a bed" };
   }
 
   await mineBlockReliably(bot, block, { tool: pickaxeOrAxeForBlock(block.name) });
@@ -585,6 +637,8 @@ function collectState(
   const held = bot.heldItem;
 
   const inv = buildInventoryContext(bot);
+  const sleepSync = getSleepSyncState();
+  const botSleeping = Boolean((bot as Bot & { isSleeping?: boolean }).isSleeping);
 
   const state: CompanionState = {
     player: {
@@ -611,7 +665,9 @@ function collectState(
     nearbyChest: hasNearbyChest(bot),
     nearbyCraftingTable: hasNearbyCraftingTable(bot),
     nearbyStructures: scanNearbyStructures(bot, 12),
-    facingLabel: yawToCompassLabel(bot.entity.yaw)
+    facingLabel: yawToCompassLabel(bot.entity.yaw),
+    ownerSleeping: sleepSync.ownerSleeping,
+    lunaSleeping: sleepSync.lunaSleeping || botSleeping
   };
 
   if (ownerUsername && bot.players[ownerUsername]?.entity) {
@@ -792,6 +848,7 @@ function trackOwnerActivity(
     if (!bot.entity) {
       return;
     }
+    const ownerEntity = bot.players[ownerUsername]?.entity;
     const held = readPlayerHeldItem(bot, ownerUsername);
     const nearTable = ownerNearCraftingTable(bot, ownerUsername);
     if (held && held !== lastHeld) {

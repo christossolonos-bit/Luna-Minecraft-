@@ -194,3 +194,67 @@ export function formatCompanionContextForLlm(
 
   return lines.filter(Boolean).join("\n");
 }
+
+/**
+ * Slim snapshot for chat-only Luna — no crafting recipes or task-planning hints.
+ */
+export function formatCompanionContextForChatOnly(
+  state: CompanionState,
+  options: CompanionContextOptions
+): string {
+  const lines: string[] = [];
+
+  if (options.statusLine) {
+    lines.push(options.statusLine);
+  }
+
+  const luna = state.player;
+  lines.push(
+    `Luna: pos (${luna.position.x.toFixed(0)},${luna.position.y.toFixed(0)},${luna.position.z.toFixed(0)}) ` +
+      `facing ${state.facingLabel ?? "unknown"} ` +
+      `health ${luna.health.toFixed(0)}/20 hunger ${luna.hunger}/20 ` +
+      `holding ${luna.heldItem ?? "nothing"}.`
+  );
+
+  if (state.owner) {
+    const o = state.owner;
+    const dist = ownerDistanceM(state);
+    lines.push(
+      `${options.ownerName}: pos (${o.position.x.toFixed(0)},${o.position.y.toFixed(0)},${o.position.z.toFixed(0)}) ` +
+        `${dist !== null ? `${dist.toFixed(0)}m away` : ""} holding ${o.heldItem ?? "nothing"}.`
+    );
+  } else {
+    lines.push(`${options.ownerName}: not in world or out of range.`);
+  }
+
+  const world = state.world;
+  lines.push(
+    `World: ${world.dimension} ${timeLabel(world.timeOfDay)}` +
+      `${world.biome ? ` biome ${world.biome}` : ""}` +
+      `${world.timeOfDay !== undefined ? ` time=${world.timeOfDay}` : ""}.`
+  );
+
+  if (world.nearbyBlocks?.length) {
+    lines.push(`Blocks around Luna (5x5x4): ${world.nearbyBlocks.join(", ")}.`);
+  }
+
+  lines.push(formatNearbyEntities(state));
+
+  if (state.inventorySummary) {
+    lines.push(state.inventorySummary);
+  } else if (state.inventory?.length) {
+    const invLimit = Number(process.env.MC_AI_CONTEXT_INV_ITEMS ?? "24") || 24;
+    const inv = state.inventory
+      .slice(0, invLimit)
+      .map((i) => `${i.name}x${i.count}`)
+      .join(", ");
+    lines.push(`Luna inventory: ${inv}.`);
+  }
+
+  lines.push(...formatRecentActivity(state, options.ownerName));
+  lines.push(
+    "Actions (gather wood, follow me, etc.) are handled by written/voice commands — chat is conversation only."
+  );
+
+  return lines.filter(Boolean).join("\n");
+}

@@ -25,8 +25,11 @@ export function asksAboutOwnerGift(message: string): boolean {
 
 export function asksAboutLunaState(message: string): boolean {
   const m = message.toLowerCase();
-  return /\b(where are you|how much health|how hungry|are you hurt|are you stuck)\b/.test(m) &&
-    /\b(you|luna)\b/.test(m);
+  return (
+    /\b(where are you going|what are you doing|where are you|how much health|how hungry|are you hurt|are you stuck|why did you go)\b/.test(
+      m
+    ) && /\b(you|luna)\b/.test(m)
+  );
 }
 
 export type OwnerQuestionTurn = {
@@ -70,8 +73,13 @@ export function resolveDirectOwnerQuestion(
 
   if (asksAboutLunaState(message)) {
     const p = state.player;
+    const m = message.toLowerCase();
+    let say = `I'm at (${p.position.x.toFixed(0)}, ${p.position.y.toFixed(0)}, ${p.position.z.toFixed(0)}) with ${p.health.toFixed(0)} health and ${p.hunger}/20 hunger.`;
+    if (/\b(where are you going|what are you doing)\b/.test(m)) {
+      say = `I'm at (${p.position.x.toFixed(0)}, ${p.position.y.toFixed(0)}, ${p.position.z.toFixed(0)}). Say come here or follow me if you want me with you.`;
+    }
     return {
-      say: `I'm at (${p.position.x.toFixed(0)}, ${p.position.y.toFixed(0)}, ${p.position.z.toFixed(0)}) with ${p.health.toFixed(0)} health and ${p.hunger}/20 hunger.`,
+      say,
       move: "none",
       lookAt: "none",
       task: "none"

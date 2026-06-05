@@ -4,8 +4,10 @@ import {
   checkCraftMaterials,
   parseCraftItemRequest
 } from "./craft-requests";
+import { parseOwnerTaskChain } from "./task-chains";
 import {
   asksAboutInventory,
+  asksAboutLunaState,
   isOwnerDirectQuestion,
   resolveDirectOwnerQuestion
 } from "./owner-questions";
@@ -27,6 +29,8 @@ export type TaskIntent =
   | "craft_tools"
   | "craft_survival"
   | "deposit_chest"
+  | "collect_wheat"
+  | "plant_wheat"
   | "fight_mobs"
   | "hunt_animal";
 
@@ -47,12 +51,36 @@ export type McTurnResult = {
   taskTarget?: string;
 };
 
+/** Short reply when the LLM fails but voice/chat still needs a line in-game + TTS. */
+export function heuristicVoiceSay(message: string): string {
+  const m = message.toLowerCase();
+  if (/\b(can you hear|hear me|you hear me|are you listening|listening to me)\b/.test(m)) {
+    return "Yes, I hear you!";
+  }
+  if (/\b(hello|hey luna|hi luna)\b/.test(m) || /^(hi|hey)\b/.test(m.trim())) {
+    return "Hey! I'm right here.";
+  }
+  if (/\b(thank you|thanks)\b/.test(m)) {
+    return "You're welcome!";
+  }
+  if (/\b(how are you|you ok|you okay|are you ok)\b/.test(m)) {
+    return "I'm good — what do you need?";
+  }
+  return "Got it!";
+}
+
 export function parseTurnResponse(raw: string, userMessage: string): McTurnResult {
   const trimmed = raw.trim();
+  if (/no_think/i.test(trimmed) || /^\s*\{[^}]*"error"/i.test(trimmed)) {
+    return { ...heuristicTurn(userMessage), say: heuristicVoiceSay(userMessage) };
+  }
   const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
     try {
       const data = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+      if (data.error != null) {
+        throw new Error("model error payload");
+      }
       if ("role" in data && typeof data.say !== "string") {
         throw new Error("chat API shape, not Luna turn JSON");
       }
@@ -91,8 +119,11 @@ export function parseTurnResponse(raw: string, userMessage: string): McTurnResul
   }
   const task = heuristicTask(userMessage);
   const huntTarget = parseHuntTarget(userMessage) ?? undefined;
+  const plain = trimmed.replace(/^```[\s\S]*?```/g, "").trim();
+  const bland = /^(got it!?|okay!?|on it!?|sure\.?|ok\.?)$/i.test(plain);
+  const say = bland || !plain || plain.startsWith("{") ? heuristicVoiceSay(userMessage) : plain;
   return {
-    say: trimmed.replace(/^```[\s\S]*?```/g, "").trim() || "Got it.",
+    say,
     move: heuristicMove(userMessage),
     lookAt: heuristicMove(userMessage) !== "none" ? "owner" : "none",
     task,
@@ -125,6 +156,8 @@ function normalizeTask(value: unknown): TaskIntent | null {
   if (v === "craft_tools" || v === "craft") return "craft_tools";
   if (v === "craft_survival" || v === "survival_gear" || v === "craft_gear") return "craft_survival";
   if (v === "deposit_chest" || v === "deposit") return "deposit_chest";
+  if (v === "collect_wheat" || v === "wheat" || v === "harvest_wheat") return "collect_wheat";
+  if (v === "plant_wheat" || v === "replant" || v === "plant_farm") return "plant_wheat";
   if (v === "fight_mobs" || v === "fight" || v === "combat") return "fight_mobs";
   if (v === "hunt_animal" || v === "hunt" || v === "hunt_mob") return "hunt_animal";
   if (v === "none" || v === "") return "none";
@@ -210,11 +243,7 @@ export function heuristicMove(message: string): MoveIntent {
   if (/\b(follow me|stay with me|stick with me|keep following)\b/.test(m)) {
     return "follow_owner";
   }
-  if (
-    /\b(come here|come to me|get over here|come closer|where are you|walk over|get here)\b/.test(
-      m
-    )
-  ) {
+  if (/\b(come here|come to me|get over here|come closer|walk over|get here)\b/.test(m)) {
     return "come_to_owner";
   }
   return "none";
@@ -302,6 +331,18 @@ export function heuristicTask(message: string): TaskIntent {
   if (/\b(mine coal|get coal|gather coal|collect coal)\b/.test(m)) {
     return "gather_coal";
   }
+  if (/\b(collect|harvest|gather|get|pick)\s+(the\s+|my\s+|)(wheat|farm)\b/.test(m)) {
+    return "collect_wheat";
+  }
+  if (/\b(collect wheat|harvest wheat|farm wheat)\b/.test(m)) {
+    return "collect_wheat";
+  }
+  if (/\b(plant wheat|replant farm|plant seeds|sow wheat)\b/.test(m)) {
+    return "plant_wheat";
+  }
+  if (/\b(plant|replant|sow|seed)\s+(the\s+|my\s+|)(wheat|farm|seeds?)\b/.test(m)) {
+    return "plant_wheat";
+  }
   if (
     /\b(craft torches?|make torches?|craft armor|make armor|craft bread|survival gear|craft gear|make shield|craft furnace)\b/.test(
       m
@@ -355,7 +396,7 @@ export function focusTurnOnUserIntent(turn: McTurnResult, userMessage: string): 
     focused.equip = "none";
     focused.hotbarSlot = undefined;
     focused.craftItem = undefined;
-  } else if (asksAboutInventory(userMessage)) {
+  } else if (asksAboutInventory(userMessage) || asksAboutLunaState(userMessage)) {
     focused.move = "none";
     focused.lookAt = "none";
     focused.task = "none";
@@ -532,12 +573,12 @@ export function splitOwnerCommands(message: string): string[] {
   if (!trimmed) {
     return [];
   }
-  if (trimmed.length > 100) {
+  if (trimmed.length > 140) {
     return [trimmed];
   }
 
   const chunks = trimmed
-    .split(/\s*(?:,|;|\band\b|\bthen\b)\s*/i)
+    .split(/\s*(?:,|;|\band then\b|\band\b|\bthen\b|\bafter that\b)\s*/i)
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
 
@@ -554,19 +595,5 @@ export function splitOwnerCommands(message: string): string[] {
 }
 
 export function suggestTaskChain(message: string): TaskIntent[] {
-  const m = message.toLowerCase();
-  if (/\b(gather everything|stock up|full routine|do everything)\b/.test(m)) {
-    return ["gather_wood", "gather_stone", "gather_coal", "craft_tools", "craft_survival", "deposit_chest"];
-  }
-  if (/\b(gather wood and craft|chop trees and make tools)\b/.test(m)) {
-    return ["gather_wood", "craft_tools"];
-  }
-  if (/\b(chop wood and put|gather and deposit|mine and store)\b/.test(m)) {
-    const chain: TaskIntent[] = [];
-    if (/wood|tree|log/.test(m)) chain.push("gather_wood");
-    if (/stone|cobble/.test(m)) chain.push("gather_stone");
-    chain.push("deposit_chest");
-    return chain;
-  }
-  return [];
+  return parseOwnerTaskChain(message);
 }

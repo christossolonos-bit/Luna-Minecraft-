@@ -4,8 +4,8 @@ import { CompanionState } from "../types";
 import { McAiConfig } from "./config";
 import { parseTurnResponse, McTurnResult } from "./actions";
 import { ollamaChat, ChatMessage } from "./ollama";
-import { buildMcSystemPrompt } from "./persona";
-import { formatCompanionContextForLlm } from "./companion-context";
+import { buildMcChatOnlyPrompt, buildMcSystemPrompt } from "./persona";
+import { formatCompanionContextForChatOnly, formatCompanionContextForLlm } from "./companion-context";
 
 export class McBrain {
   private readonly memory: ChatMessage[] = [];
@@ -16,6 +16,8 @@ export class McBrain {
   private survivalSummary = "";
   private tutorialSummary = "";
   private statusSummary = "";
+  private ownerFeedbackSummary = "";
+  private plannerSummary = "";
 
   constructor(private readonly config: McAiConfig) {
     this.loadMemory();
@@ -35,6 +37,14 @@ export class McBrain {
 
   setStatusSummary(summary: string): void {
     this.statusSummary = summary;
+  }
+
+  setOwnerFeedbackSummary(summary: string): void {
+    this.ownerFeedbackSummary = summary;
+  }
+
+  setPlannerSummary(summary: string): void {
+    this.plannerSummary = summary;
   }
 
   setLearningSummary(summary: string): void {
@@ -95,11 +105,44 @@ export class McBrain {
     if (this.tutorialSummary) {
       extras.push(this.tutorialSummary);
     }
+    if (this.ownerFeedbackSummary) {
+      extras.push(this.ownerFeedbackSummary);
+    }
+    if (this.plannerSummary) {
+      extras.push(this.plannerSummary);
+    }
 
     const full = extras.length ? `${core}\n${extras.join("\n")}` : core;
 
     if (process.env.MC_AI_LOG_CONTEXT === "true") {
       console.log(`[context] ${full.length} chars → LLM\n${full.slice(0, 1200)}${full.length > 1200 ? "…" : ""}`);
+    }
+
+    return full;
+  }
+
+  private gameContextForChat(state: CompanionState | null): string {
+    if (!state) {
+      return "GAME STATE: not connected to Minecraft yet.";
+    }
+
+    const core = formatCompanionContextForChatOnly(state, {
+      ownerName: this.config.owner,
+      statusLine: this.statusSummary || undefined
+    });
+
+    const extras: string[] = [];
+    if (this.tutorialSummary) {
+      extras.push(this.tutorialSummary);
+    }
+    if (this.ownerFeedbackSummary) {
+      extras.push(this.ownerFeedbackSummary);
+    }
+
+    const full = extras.length ? `${core}\n${extras.join("\n")}` : core;
+
+    if (process.env.MC_AI_LOG_CONTEXT === "true") {
+      console.log(`[context/chat] ${full.length} chars → LLM\n${full.slice(0, 1200)}${full.length > 1200 ? "…" : ""}`);
     }
 
     return full;
@@ -149,6 +192,43 @@ export class McBrain {
   ): Promise<string> {
     const turn = await this.replyTurn(message, state, source);
     return turn.say;
+  }
+
+  /** Conversational reply only — no task/move parsing (simple written commands handle actions). */
+  async replyChatOnly(
+    message: string,
+    state: CompanionState | null,
+    source = "Minecraft chat"
+  ): Promise<string> {
+    const userContent =
+      `[${this.config.owner} via ${source}]: ${message.trim()}\n\n` +
+      `--- GAME STATE (live from Minecraft) ---\n${this.gameContextForChat(state)}`.trim();
+
+    const messages: ChatMessage[] = [
+      { role: "system", content: buildMcChatOnlyPrompt(this.config.owner) },
+      ...this.memory.slice(-this.config.memoryTurns * 2),
+      { role: "user", content: userContent }
+    ];
+
+    const raw = await ollamaChat({
+      host: this.config.ollamaHost,
+      model: this.config.model,
+      messages,
+      numPredict: Math.max(this.config.numPredict, 96),
+      temperature: this.config.temperature
+    });
+
+    const turn = parseTurnResponse(raw, message);
+    const say = turn.say?.trim() ?? "";
+    if (say) {
+      this.memory.push({ role: "user", content: userContent });
+      this.memory.push({ role: "assistant", content: say });
+      while (this.memory.length > this.config.memoryTurns * 2) {
+        this.memory.shift();
+      }
+      this.persistMemory();
+    }
+    return say;
   }
 
   /** Returns a prompt for a new build event, or null if already seen. */

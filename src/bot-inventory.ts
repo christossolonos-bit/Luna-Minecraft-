@@ -74,6 +74,13 @@ export function buildInventoryContext(bot: Bot): InventoryContext {
   return { items, hotbar, selectedSlot, heldItem: held, summary };
 }
 
+export function hasToolCategory(bot: Bot, category: ToolCategory): boolean {
+  return findBestTool(bot, category) != null;
+}
+
+export const PICKAXE_ITEM_NAMES = PICK_NAMES;
+export const AXE_ITEM_NAMES = AXE_NAMES;
+
 export function findBestTool(bot: Bot, category: ToolCategory) {
   const list =
     category === "sword"

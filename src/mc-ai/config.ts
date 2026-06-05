@@ -22,7 +22,7 @@ export function loadMcAiConfig(): McAiConfig {
     model: (process.env.MC_AI_MODEL ?? "qwen3.5:4b").trim(),
     numPredict: Math.max(32, Number(process.env.MC_AI_NUM_PREDICT ?? "96") || 96),
     temperature: Number(process.env.MC_AI_TEMPERATURE ?? "0.75") || 0.75,
-    memoryTurns: Math.max(0, Number(process.env.MC_AI_MEMORY_TURNS ?? "8") || 8),
+    memoryTurns: Math.max(0, Number(process.env.MC_AI_MEMORY_TURNS ?? "12") || 12),
     replyCooldownMs: Math.max(0, Number(process.env.MC_AI_REPLY_COOLDOWN_MS ?? "800") || 800),
     buildComments: process.env.MC_AI_BUILD_COMMENTS === "true",
     buildCommentCooldownMs: Math.max(

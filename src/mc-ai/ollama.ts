@@ -63,11 +63,41 @@ export async function checkOllamaHealth(host: string, model: string): Promise<st
   }
 }
 
-export async function ollamaChat(options: OllamaChatOptions): Promise<string> {
+/** Qwen sometimes returns `{"error":"no_think"}` when /no_think is appended — not a usable reply. */
+export function isBrokenOllamaContent(text: string): boolean {
+  const t = text.trim();
+  if (!t) {
+    return true;
+  }
+  if (/no_think/i.test(t)) {
+    return true;
+  }
+  if (t.startsWith("{") && t.includes("error")) {
+    try {
+      const data = JSON.parse(t) as { error?: unknown; say?: unknown };
+      if (data.error != null) {
+        return true;
+      }
+      if (typeof data.say !== "string" || !String(data.say).trim()) {
+        return true;
+      }
+    } catch {
+      // not JSON — keep
+    }
+  }
+  return false;
+}
+
+async function ollamaChatOnce(
+  options: OllamaChatOptions,
+  think: boolean,
+  appendNoThink: boolean
+): Promise<string> {
   const url = `${options.host}/api/chat`;
-  const think = parseThinkFlag(options.think);
   const messages =
-    think === false ? withNoThinkDirective(options.messages) : options.messages;
+    appendNoThink && think === false
+      ? withNoThinkDirective(options.messages)
+      : options.messages;
 
   let response: Response;
   try {
@@ -105,4 +135,18 @@ export async function ollamaChat(options: OllamaChatOptions): Promise<string> {
 
   const data = (await response.json()) as { message?: { content?: string } };
   return stripThinkBlocks(data.message?.content ?? "");
+}
+
+export async function ollamaChat(options: OllamaChatOptions): Promise<string> {
+  const thinkFirst = parseThinkFlag(options.think);
+  let content = await ollamaChatOnce(options, thinkFirst, thinkFirst === false);
+  if (isBrokenOllamaContent(content)) {
+    console.warn("[ollama] bad model payload — retrying with thinking enabled");
+    content = await ollamaChatOnce({ ...options, think: true }, true, false);
+  }
+  if (isBrokenOllamaContent(content)) {
+    console.warn("[ollama] retry still empty — second attempt without /no_think");
+    content = await ollamaChatOnce(options, false, false);
+  }
+  return content;
 }

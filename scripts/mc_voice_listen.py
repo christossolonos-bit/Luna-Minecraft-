@@ -31,7 +31,12 @@ def _ptt_mode() -> bool:
 
 
 def _ptt_key() -> str:
-    return (os.environ.get("MC_STT_PTT_KEY") or "v").strip().lower() or "v"
+    raw = (os.environ.get("MC_STT_PTT_KEY") or "v").strip().strip('"').strip("'")
+    if not raw:
+        return "v"
+    aliases = {"equals": "=", "equal": "="}
+    key = aliases.get(raw.lower(), raw)
+    return key.lower() if len(key) == 1 and key.isalpha() else key
 
 
 def _resolve_device() -> str:

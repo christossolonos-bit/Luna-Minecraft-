@@ -142,6 +142,10 @@ export const actionRequestSchema = z.object({
         "craft_tools",
         "craft_survival",
         "deposit_chest",
+        "take_tool",
+        "check_logs",
+        "collect_wheat",
+        "plant_wheat",
         "fight_mobs",
         "hunt_animal"
       ]),
@@ -173,7 +177,8 @@ export const actionResultSchema = z.object({
   payload: z.object({
     ok: z.boolean(),
     action: z.string(),
-    reason: z.string().optional()
+    reason: z.string().optional(),
+    detail: z.string().optional()
   })
 });
 

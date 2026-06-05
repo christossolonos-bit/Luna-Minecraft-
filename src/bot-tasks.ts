@@ -10,7 +10,11 @@ import {
   hasNearbyCraftingTable,
   processWoodInventory
 } from "./bot-craft";
+import { depositAllToEmptyDoubleChest, takeToolFromNearbyChest } from "./bot-chest";
 import { abortActiveMining, mineBlockReliably, pickaxeOrAxeForBlock } from "./bot-gather";
+import { collectWheatAndStash, plantWheatAtFarm } from "./bot-farm";
+import { chopTreeAndStash, summarizeBotLogInventory } from "./bot-tree";
+import { isSleepRoutineActive } from "./bot-sleep";
 import { prepareToolsForTask } from "./bot-inventory";
 import { ActionResult } from "./types";
 
@@ -24,7 +28,11 @@ export type BotTaskName =
   | "craft_survival"
   | "deposit_chest"
   | "fight_mobs"
-  | "hunt_animal";
+  | "hunt_animal"
+  | "take_tool"
+  | "check_logs"
+  | "collect_wheat"
+  | "plant_wheat";
 
 export type BotTaskOptions = {
   amount?: number;
@@ -55,19 +63,6 @@ const STONE_MATCH = (block: Block) =>
 const COAL_MATCH = (block: Block) =>
   block.name === "coal_ore" || block.name === "deepslate_coal_ore";
 
-const DEPOSIT_ITEM = (name: string) =>
-  name.endsWith("_log") ||
-  name.endsWith("_planks") ||
-  name.endsWith("_stem") ||
-  name === "cobblestone" ||
-  name === "cobbled_deepslate" ||
-  name === "raw_iron" ||
-  name === "raw_gold" ||
-  name === "raw_copper" ||
-  name === "coal" ||
-  name === "stick" ||
-  name === "flint";
-
 export async function runBotTask(
   bot: Bot,
   task: BotTaskName,
@@ -78,13 +73,24 @@ export async function runBotTask(
   const timeoutMs = options.timeoutMs ?? 120_000;
   const deadline = Date.now() + timeoutMs;
 
+  if (isSleepRoutineActive()) {
+    return { ok: false, action: "run_task", reason: "paused — owner is sleeping" };
+  }
+
   try {
-    if (task !== "craft_tools" && task !== "deposit_chest") {
+    if (
+      task !== "craft_tools" &&
+      task !== "deposit_chest" &&
+      task !== "take_tool" &&
+      task !== "check_logs" &&
+      task !== "collect_wheat" &&
+      task !== "plant_wheat"
+    ) {
       await prepareToolsForTask(bot, task);
     }
     switch (task) {
       case "gather_wood":
-        return await gatherMatching(bot, LOG_MATCH, amount, maxDistance, deadline);
+        return await gatherWoodTree(bot, maxDistance, deadline);
       case "gather_stone":
         return await gatherMatching(bot, STONE_MATCH, amount, maxDistance, deadline);
       case "gather_coal":
@@ -95,6 +101,44 @@ export async function runBotTask(
         return await craftSurvivalGear(bot, maxDistance);
       case "deposit_chest":
         return await depositToChest(bot, maxDistance);
+      case "take_tool": {
+        const kind = options.target === "pickaxe" ? "pickaxe" : "axe";
+        const taken = await takeToolFromNearbyChest(bot, kind, maxDistance);
+        return {
+          ok: taken.ok,
+          action: "run_task",
+          reason: taken.reason,
+          detail: taken.ok ? taken.reason : undefined
+        };
+      }
+      case "check_logs": {
+        const summary = summarizeBotLogInventory(bot);
+        const msg = summary.canPillar ? `Yes — ${summary.message}` : summary.message;
+        return {
+          ok: true,
+          action: "run_task",
+          reason: msg,
+          detail: summary.canPillar ? "can_pillar" : "no_logs"
+        };
+      }
+      case "collect_wheat": {
+        const result = await collectWheatAndStash(bot, maxDistance, deadline);
+        return {
+          ok: result.ok,
+          action: "run_task",
+          reason: result.reason,
+          detail: result.ok ? result.reason : undefined
+        };
+      }
+      case "plant_wheat": {
+        const result = await plantWheatAtFarm(bot, maxDistance, deadline);
+        return {
+          ok: result.ok,
+          action: "run_task",
+          reason: result.reason,
+          detail: result.ok ? result.reason : undefined
+        };
+      }
       case "fight_mobs":
         return await fightHostiles(bot, { maxDistance, timeoutMs: Math.min(timeoutMs, 60_000) });
       case "hunt_animal":
@@ -127,6 +171,20 @@ function collectBlockPlugin(bot: Bot) {
     .collectBlock;
 }
 
+async function gatherWoodTree(
+  bot: Bot,
+  maxDistance: number,
+  deadline: number
+): Promise<BotTaskResult> {
+  const result = await chopTreeAndStash(bot, maxDistance, deadline);
+  return {
+    ok: result.ok,
+    action: "run_task",
+    reason: result.reason,
+    detail: result.ok ? result.reason : undefined
+  };
+}
+
 async function gatherMatching(
   bot: Bot,
   matching: (block: Block) => boolean,
@@ -138,6 +196,13 @@ async function gatherMatching(
   let lastError = "";
 
   while (collected < amount && Date.now() < deadline) {
+    if (isSleepRoutineActive()) {
+      return {
+        ok: collected > 0,
+        action: "run_task",
+        reason: collected > 0 ? `paused after ${collected} blocks` : "paused — owner is sleeping"
+      };
+    }
     const block = bot.findBlock({ matching, maxDistance, count: 1 });
     if (!block) {
       break;
@@ -339,55 +404,12 @@ function countItem(bot: Bot, name: string): number {
 }
 
 async function depositToChest(bot: Bot, maxDistance: number): Promise<BotTaskResult> {
-  const chestBlock = bot.findBlock({
-    matching: (b) => b.name === "chest" || b.name === "trapped_chest",
-    maxDistance,
-    count: 1
-  });
-  if (!chestBlock) {
-    return {
-      ok: false,
-      action: "run_task",
-      reason: "No chest found within 48 blocks."
-    };
-  }
-
-  const collector = collectBlockPlugin(bot);
-  if (collector && "chestLocations" in collector) {
-    const locs = (collector as { chestLocations: { x: number; y: number; z: number }[] }).chestLocations;
-    const pos = chestBlock.position;
-    const exists = locs.some((p) => p.x === pos.x && p.y === pos.y && p.z === pos.z);
-    if (!exists) {
-      locs.push(pos);
-    }
-  }
-
-  const container = await bot.openContainer(chestBlock);
-  let moved = 0;
-  try {
-    for (const item of [...bot.inventory.items()]) {
-      if (!DEPOSIT_ITEM(item.name)) {
-        continue;
-      }
-      await container.deposit(item.type, null, item.count);
-      moved += item.count;
-    }
-  } finally {
-    await container.close();
-  }
-
-  if (moved === 0) {
-    return {
-      ok: false,
-      action: "run_task",
-      reason: "Nothing to deposit (gather wood/stone first)."
-    };
-  }
-
+  const result = await depositAllToEmptyDoubleChest(bot, maxDistance);
   return {
-    ok: true,
+    ok: result.ok,
     action: "run_task",
-    detail: `stored ${moved} items in chest`
+    reason: result.reason,
+    detail: result.ok ? result.reason : undefined
   };
 }
 

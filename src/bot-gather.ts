@@ -3,6 +3,7 @@ import { Block } from "prismarine-block";
 import { goals, Movements } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { equipToolCategory } from "./bot-inventory";
+import { isBedBlock, isBedBlockName, isSleepRoutineActive } from "./bot-sleep";
 
 const MAX_DIG_REACH = 4.5;
 
@@ -34,6 +35,11 @@ function configureGatherMovements(bot: Bot): Movements {
   movements.allowSprinting = true;
   movements.dontMineUnderFallingBlock = false;
   movements.dontCreateFlow = false;
+  for (const name of Object.keys(bot.registry.blocksByName)) {
+    if (isBedBlockName(name)) {
+      movements.blocksCantBreak.add(bot.registry.blocksByName[name].id);
+    }
+  }
   bot.pathfinder.setMovements(movements);
   return movements;
 }
@@ -81,6 +87,61 @@ function blockCenter(block: Block): Vec3 {
   return block.position.offset(0.5, 0.5, 0.5);
 }
 
+/** Dig a block already in reach — no pathfinding (for tree trunk mining). */
+export async function digBlockInReach(
+  bot: Bot,
+  block: Block,
+  options: { tool?: "pickaxe" | "axe" } = {}
+): Promise<void> {
+  if (!bot.entity) {
+    throw new Error("Bot not spawned");
+  }
+  if (isSleepRoutineActive()) {
+    throw new Error("paused — owner is sleeping");
+  }
+  if (isBedBlock(block)) {
+    throw new Error("will not break a bed");
+  }
+
+  const current = bot.blockAt(block.position);
+  if (!current || current.name === "air") {
+    throw new Error("Block already gone");
+  }
+
+  const prefer = options.tool ?? "pickaxe";
+  await equipForMining(bot, current, prefer);
+
+  const held = bot.heldItem;
+  if (!held) {
+    throw new Error(`No tool equipped to mine ${current.name}`);
+  }
+  if (!current.canHarvest(held.type)) {
+    throw new Error(`Cannot harvest ${current.name} with ${held.name}`);
+  }
+
+  const dist = bot.entity.position.distanceTo(blockCenter(current));
+  if (dist > MAX_DIG_REACH) {
+    throw new Error(`Too far to mine ${current.name} (${dist.toFixed(1)}m)`);
+  }
+
+  await bot.lookAt(blockCenter(current), true);
+
+  const digTimeout = Number(process.env.MC_DIG_TIMEOUT_MS ?? "30000") || 30_000;
+  await Promise.race([
+    bot.dig(current),
+    new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        try {
+          bot.stopDigging();
+        } catch {
+          // ignore
+        }
+        reject(new Error(`dig ${current.name} timed out`));
+      }, digTimeout);
+    })
+  ]);
+}
+
 /**
  * Walk adjacent to the block, equip a harvest-capable tool, then dig until broken.
  * Avoids collectBlock GoalLookAtBlock "swing at air" when out of reach.
@@ -92,6 +153,12 @@ export async function mineBlockReliably(
 ): Promise<void> {
   if (!bot.entity) {
     throw new Error("Bot not spawned");
+  }
+  if (isSleepRoutineActive()) {
+    throw new Error("paused — owner is sleeping");
+  }
+  if (isBedBlock(block)) {
+    throw new Error("will not break a bed");
   }
 
   configureGatherMovements(bot);

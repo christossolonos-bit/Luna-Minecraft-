@@ -167,7 +167,8 @@ export class CompanionClient {
             const result: ActionResult = {
               ok: parsedResult.data.payload.ok,
               action: parsedResult.data.payload.action as CompanionAction["type"],
-              reason: parsedResult.data.payload.reason
+              reason: parsedResult.data.payload.reason,
+              detail: parsedResult.data.payload.detail
             };
             this.actionResultHandlers.forEach((handler) => handler(result));
             if (

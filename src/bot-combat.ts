@@ -68,10 +68,6 @@ export function entityKindName(entity: Entity): string {
   if (disp && typeof disp === "object" && typeof disp.text === "string") {
     return normalizeEntityKind(disp.text);
   }
-  const mobType = (entity as Entity & { mobType?: string }).mobType;
-  if (mobType) {
-    return normalizeEntityKind(mobType);
-  }
   return "";
 }
 

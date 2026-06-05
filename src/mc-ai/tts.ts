@@ -11,9 +11,42 @@ export type McTtsConfig = {
   maxChars: number;
 };
 
+/** Default: Microsoft Edge Ava Multilingual (en-US). */
+export const DEFAULT_TTS_VOICE = "en-US-AvaMultilingualNeural";
+
+/** Short names from .env → Edge TTS neural voice ids. */
+const VOICE_ALIASES: Record<string, string> = {
+  ava: DEFAULT_TTS_VOICE,
+  "ava-multilingual": DEFAULT_TTS_VOICE,
+  "ava-multolingual": DEFAULT_TTS_VOICE,
+  "ava-multilingual-neural": DEFAULT_TTS_VOICE,
+  aria: "en-US-AriaNeural",
+  jenny: "en-US-JennyNeural",
+  sonia: "en-GB-SoniaNeural"
+};
+
+function normalizeVoiceKey(raw: string): string {
+  return raw.trim().toLowerCase().replace(/\s+/g, "-");
+}
+
+export function resolveTtsVoice(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return DEFAULT_TTS_VOICE;
+  }
+  if (trimmed.includes("Neural") || trimmed.includes("-")) {
+    const alias = VOICE_ALIASES[normalizeVoiceKey(trimmed)];
+    if (alias) {
+      return alias;
+    }
+    return trimmed;
+  }
+  return VOICE_ALIASES[normalizeVoiceKey(trimmed)] ?? trimmed;
+}
+
 export function loadMcTtsConfig(): McTtsConfig {
   return {
-    voice: (process.env.MC_TTS_VOICE ?? "en-US-AvaMultilingualNeural").trim(),
+    voice: resolveTtsVoice(process.env.MC_TTS_VOICE ?? "ava-multilingual"),
     rate: (process.env.MC_TTS_RATE ?? "+0%").trim(),
     pitch: (process.env.MC_TTS_PITCH ?? "+0Hz").trim(),
     maxChars: Math.max(80, Number(process.env.MC_TTS_MAX_CHARS ?? "400") || 400)

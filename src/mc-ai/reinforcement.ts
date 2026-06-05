@@ -360,6 +360,23 @@ export class GameplayRL {
     return this.mem.goalValues[goal]?.streakFail ?? 0;
   }
 
+  /** Owner said good job / bad job — nudge learned Q for that activity. */
+  ownerAdjustGoal(goal: SurvivalGoal, delta: number): void {
+    if (!this.enabled) {
+      return;
+    }
+    const gv = this.mem.goalValues[goal] ?? { q: 0, trials: 0, streakFail: 0 };
+    gv.trials += 1;
+    gv.q = Math.max(-8, Math.min(8, gv.q + delta));
+    if (delta < 0) {
+      gv.streakFail += 1;
+    } else if (delta > 0) {
+      gv.streakFail = 0;
+    }
+    this.mem.goalValues[goal] = gv;
+    saveMemory(this.mem);
+  }
+
   /** Optional deeper reflection via Ollama (async, non-blocking). */
   scheduleLlmReflection(ollamaHost: string, model: string): void {
     if (process.env.MC_AI_RL_REFLECT_LLM !== "true" || this.llmReflectPending) {

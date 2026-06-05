@@ -11,7 +11,7 @@ void startMineflayerGame({
 });
 
 console.log("");
-console.log("=== Luna Companion (Mineflayer) ===");
+console.log("=== Luna Companion (follow, tp, sleep) ===");
 console.log("1) Open your Minecraft single-player world");
 const mcPort = process.env.MC_PORT ?? "25565";
 console.log(`2) Esc → Open to LAN (your port: ${mcPort})`);

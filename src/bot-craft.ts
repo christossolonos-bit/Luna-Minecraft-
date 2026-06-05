@@ -156,24 +156,21 @@ export async function craftSticksFromPlanks(bot: Bot, minSticks = 4): Promise<nu
   return crafted;
 }
 
-export async function placeBlockBesideBot(bot: Bot, blockName: string): Promise<boolean> {
+async function tryPlaceOnGround(
+  bot: Bot,
+  blockName: string,
+  anchor: Vec3,
+  offsets: Vec3[]
+): Promise<boolean> {
   const stack = bot.inventory.items().find((i) => i.name === blockName);
   if (!stack) {
     return false;
   }
 
   await bot.equip(stack, "hand");
-  const feet = bot.entity.position.floored();
-  const offsets = [
-    new Vec3(1, 0, 0),
-    new Vec3(-1, 0, 0),
-    new Vec3(0, 0, 1),
-    new Vec3(0, 0, -1),
-    new Vec3(0, 1, 0)
-  ];
 
   for (const off of offsets) {
-    const target = feet.plus(off);
+    const target = anchor.plus(off);
     const ground = bot.blockAt(target.offset(0, -1, 0));
     const air = bot.blockAt(target);
     if (!ground || ground.name === "air" || !air || air.name !== "air") {
@@ -188,6 +185,43 @@ export async function placeBlockBesideBot(bot: Bot, blockName: string): Promise<
     }
   }
   return false;
+}
+
+const BESIDE_OFFSETS = [
+  new Vec3(1, 0, 0),
+  new Vec3(-1, 0, 0),
+  new Vec3(0, 0, 1),
+  new Vec3(0, 0, -1),
+  new Vec3(0, 1, 0)
+];
+
+/** Try adjacent air blocks around the bot's feet. */
+export async function placeBlockBesideBot(bot: Bot, blockName: string): Promise<boolean> {
+  return tryPlaceOnGround(bot, blockName, bot.entity.position.floored(), BESIDE_OFFSETS);
+}
+
+/** Try spots around a world position (e.g. near the owner when placing a bed). */
+export async function placeBlockNearAnchor(
+  bot: Bot,
+  blockName: string,
+  anchor: Vec3
+): Promise<boolean> {
+  const offsets = [
+    new Vec3(2, 0, 0),
+    new Vec3(-2, 0, 0),
+    new Vec3(0, 0, 2),
+    new Vec3(0, 0, -2),
+    new Vec3(3, 0, 1),
+    new Vec3(3, 0, -1),
+    new Vec3(-3, 0, 1),
+    new Vec3(-3, 0, -1),
+    new Vec3(2, 0, 2),
+    new Vec3(2, 0, -2),
+    new Vec3(-2, 0, 2),
+    new Vec3(-2, 0, -2),
+    ...BESIDE_OFFSETS
+  ];
+  return tryPlaceOnGround(bot, blockName, anchor.floored(), offsets);
 }
 
 export function findCraftingTable(bot: Bot, maxDistance: number): Block | null {

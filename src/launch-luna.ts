@@ -143,7 +143,17 @@ async function main(): Promise<void> {
   console.log("Before you play:");
   console.log(`  1. Open Minecraft ${process.env.MC_VERSION ?? "1.21.1"} single-player world`);
   console.log(`  2. Esc → Open to LAN  (port in .env: ${mcPort})`);
-  console.log(`  3. Ollama running with ${process.env.MC_AI_MODEL ?? "qwen3.5:4b"}`);
+  const aiMode = (process.env.MC_AI_MODE ?? "simple").trim().toLowerCase();
+  if (aiMode === "full" || aiMode === "advanced") {
+    const model = process.env.MC_AI_MODEL ?? "qwen3.5:4b";
+    const ttsVoice = process.env.MC_TTS_VOICE ?? "ava-multilingual";
+    const voiceOn = process.env.MC_AI_VOICE !== "false" && process.env.MC_AI_VOICE_TTS !== "false";
+    console.log(
+      `  3. Ollama running with ${model}${voiceOn ? ` | TTS voice: ${ttsVoice}` : ""}`
+    );
+  } else {
+    console.log("  3. Simple mode — chat commands only (no Ollama). MC_AI_MODE=full for AI voice.");
+  }
   console.log("");
   console.log(`Owner: ${owner} | Bridge: ${bridgeUrl}`);
   console.log("Ctrl+C stops everything.");
@@ -184,14 +194,26 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  console.log("[launcher] Starting Luna AI (chat + voice)…");
+  const fullAi = aiMode === "full" || aiMode === "advanced";
+  const advancedAgent = (process.env.MC_AI_COMMANDS ?? "simple").trim().toLowerCase() === "advanced";
+  const chatLlm = process.env.MC_AI_CHAT_LLM !== "false";
+  const lunaLabel = fullAi
+    ? advancedAgent
+      ? "full survival AI"
+      : chatLlm
+        ? "written commands + Ollama chat"
+        : "written commands + voice (no LLM)"
+    : "simple chat commands";
+  console.log(`[launcher] Starting Luna (${lunaLabel})…`);
 
-  const ollamaHost = (process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434").replace(/\/$/, "");
-  const ollamaModel = (process.env.MC_AI_MODEL ?? "qwen3.5:4b").trim();
-  const ollamaIssue = await checkOllamaHealth(ollamaHost, ollamaModel);
-  if (ollamaIssue) {
-    console.warn(`[launcher] WARNING: ${ollamaIssue}`);
-    console.warn("[launcher] Start Ollama from the system tray, then talk to Luna again.\n");
+  if (fullAi && chatLlm) {
+    const ollamaHost = (process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434").replace(/\/$/, "");
+    const ollamaModel = (process.env.MC_AI_MODEL ?? "qwen3.5:4b").trim();
+    const ollamaIssue = await checkOllamaHealth(ollamaHost, ollamaModel);
+    if (ollamaIssue) {
+      console.warn(`[launcher] WARNING: ${ollamaIssue}`);
+      console.warn("[launcher] Start Ollama from the system tray, then talk to Luna again.\n");
+    }
   }
 
   spawnNamed("ai", "luna:ai");

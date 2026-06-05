@@ -27,7 +27,7 @@ export class McVoice {
   start(): void {
     if (!this.options.enabled || !this.options.sttEnabled) {
       if (this.options.ttsEnabled) {
-        console.log(`[voice] TTS: ${this.ttsConfig.voice}`);
+        console.log(`[voice] Edge TTS: Ava Multilingual (${this.ttsConfig.voice})`);
       }
       return;
     }
@@ -39,7 +39,7 @@ export class McVoice {
         }
       },
       onReady: () => {
-        const key = (process.env.MC_STT_PTT_KEY ?? "v").toUpperCase();
+        const key = (process.env.MC_STT_PTT_KEY ?? "=").trim() || "=";
         const mode = (process.env.MC_STT_MODE ?? "ptt").toLowerCase();
         if (mode === "vad") {
           console.log("[voice] Whisper mic ready — speak to Luna.");
@@ -70,7 +70,7 @@ export class McVoice {
       }
     });
     this.listener.start();
-    console.log(`[voice] STT: faster-whisper | TTS: ${this.ttsConfig.voice}`);
+    console.log(`[voice] STT: faster-whisper | Edge TTS: Ava Multilingual (${this.ttsConfig.voice})`);
   }
 
   async speak(text: string): Promise<void> {
