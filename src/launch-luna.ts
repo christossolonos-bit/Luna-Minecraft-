@@ -1,8 +1,10 @@
 import "dotenv/config";
 import { spawn, ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import WebSocket from "ws";
 import { checkOllamaHealth } from "./mc-ai/ollama";
+import { voiceWindowEnabled, voiceWindowHealthUrl } from "./mc-ai/voice-window";
 
 const ROOT = join(__dirname, "..");
 const port = Number(process.env.MC_SDK_PORT ?? "8787");
@@ -136,6 +138,101 @@ function shutdown(): void {
   }
 }
 
+function resolvePythonExecutable(): string {
+  const fromEnv = process.env.MC_PYTHON?.trim();
+  if (fromEnv) {
+    return fromEnv;
+  }
+  if (process.platform === "win32") {
+    return "pythonw";
+  }
+  return "python";
+}
+
+async function isVoiceWindowUp(): Promise<boolean> {
+  try {
+    const res = await fetch(voiceWindowHealthUrl(), { signal: AbortSignal.timeout(600) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForVoiceWindow(timeoutMs = 12_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await isVoiceWindowUp()) {
+      return true;
+    }
+    await sleep(400);
+  }
+  return false;
+}
+
+function spawnVoiceWindow(): ChildProcess | null {
+  const script = join(ROOT, "scripts", "luna_voice_window.py");
+  if (!existsSync(script)) {
+    console.warn("[launcher] Voice window script missing — skipping OBS voice UI.");
+    return null;
+  }
+
+  const python = resolvePythonExecutable();
+  const proc = spawn(python, [script], {
+    cwd: ROOT,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: python.toLowerCase().includes("pythonw")
+  });
+
+  proc.stdout?.on("data", (chunk) => {
+    for (const line of chunk.toString().split(/\r?\n/)) {
+      if (line.trim()) {
+        console.log(`[voice-window] ${line}`);
+      }
+    }
+  });
+  proc.stderr?.on("data", (chunk) => {
+    for (const line of chunk.toString().split(/\r?\n/)) {
+      if (line.trim()) {
+        console.error(`[voice-window] ${line}`);
+      }
+    }
+  });
+  proc.on("exit", (code) => {
+    if (code && code !== 0) {
+      console.error(`[voice-window] exited with code ${code}`);
+    }
+  });
+
+  children.push(proc);
+  return proc;
+}
+
+async function ensureVoiceWindow(): Promise<void> {
+  if (!voiceWindowEnabled()) {
+    return;
+  }
+
+  if (await isVoiceWindowUp()) {
+    console.log("[launcher] Luna Voice window already open.");
+    return;
+  }
+
+  console.log("[launcher] Opening Luna Voice window (OBS capture)…");
+  spawnVoiceWindow();
+
+  const ready = await waitForVoiceWindow();
+  if (ready) {
+    console.log("[launcher] Luna Voice window ready.");
+    return;
+  }
+
+  console.warn("[launcher] Voice window did not start — install deps and retry:");
+  console.warn("[launcher]   pip install edge-tts");
+  console.warn("[launcher]   ffmpeg on PATH (for ffplay audio)");
+  console.warn("[launcher] Or run Run Luna Voice.bat manually to see errors.");
+}
+
 async function main(): Promise<void> {
   console.log("");
   console.log("=== Luna Minecraft — all-in-one ===");
@@ -156,8 +253,13 @@ async function main(): Promise<void> {
   }
   console.log("");
   console.log(`Owner: ${owner} | Bridge: ${bridgeUrl}`);
+  if (voiceWindowEnabled()) {
+    console.log("Voice window: opens automatically for OBS (MC_TTS_WINDOW=false to disable).");
+  }
   console.log("Ctrl+C stops everything.");
   console.log("");
+
+  await ensureVoiceWindow();
 
   process.on("SIGINT", () => {
     console.log("\n[launcher] Shutting down…");

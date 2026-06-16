@@ -31,6 +31,7 @@ import {
 import { eatBestFood } from "./bot-eat";
 import { craftSpecificItem } from "./bot-craft";
 import { abortActiveMining, mineBlockReliably, pickaxeOrAxeForBlock } from "./bot-gather";
+import { requestStopStripMining } from "./bot-strip-mine";
 import {
   getSleepSyncState,
   isSleepRoutineActive,
@@ -436,6 +437,7 @@ async function executeAction(
         bot.chat(action.message);
         return { ok: true, action: "chat" };
       case "stop_all":
+        requestStopStripMining();
         abortActiveMining(bot);
         return { ok: true, action: "stop_all" };
       case "teleport_to_owner":

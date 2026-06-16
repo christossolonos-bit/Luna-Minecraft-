@@ -12,8 +12,10 @@ import {
 } from "./bot-craft";
 import { depositAllToEmptyDoubleChest, takeToolFromNearbyChest } from "./bot-chest";
 import { abortActiveMining, mineBlockReliably, pickaxeOrAxeForBlock } from "./bot-gather";
+import { buildHouseAroundSign } from "./bot-build";
 import { collectWheatAndStash, plantWheatAtFarm } from "./bot-farm";
 import { chopTreeAndStash, summarizeBotLogInventory } from "./bot-tree";
+import { minePendingOres, stripMineFromHere } from "./bot-strip-mine";
 import { isSleepRoutineActive } from "./bot-sleep";
 import { prepareToolsForTask } from "./bot-inventory";
 import { ActionResult } from "./types";
@@ -32,7 +34,10 @@ export type BotTaskName =
   | "take_tool"
   | "check_logs"
   | "collect_wheat"
-  | "plant_wheat";
+  | "plant_wheat"
+  | "build_house"
+  | "strip_mine"
+  | "mine_ores";
 
 export type BotTaskOptions = {
   amount?: number;
@@ -84,7 +89,8 @@ export async function runBotTask(
       task !== "take_tool" &&
       task !== "check_logs" &&
       task !== "collect_wheat" &&
-      task !== "plant_wheat"
+      task !== "plant_wheat" &&
+      task !== "build_house"
     ) {
       await prepareToolsForTask(bot, task);
     }
@@ -122,7 +128,13 @@ export async function runBotTask(
         };
       }
       case "collect_wheat": {
-        const result = await collectWheatAndStash(bot, maxDistance, deadline);
+        const farmRadius = Number(process.env.MC_FARM_RADIUS ?? "64") || 64;
+        const farmTimeout = options.timeoutMs ?? 300_000;
+        const result = await collectWheatAndStash(
+          bot,
+          options.maxDistance ?? farmRadius,
+          Date.now() + farmTimeout
+        );
         return {
           ok: result.ok,
           action: "run_task",
@@ -132,6 +144,40 @@ export async function runBotTask(
       }
       case "plant_wheat": {
         const result = await plantWheatAtFarm(bot, maxDistance, deadline);
+        return {
+          ok: result.ok,
+          action: "run_task",
+          reason: result.reason,
+          detail: result.ok ? result.reason : undefined
+        };
+      }
+      case "build_house": {
+        const buildDeadline = Date.now() + Math.max(timeoutMs, 600_000);
+        const result = await buildHouseAroundSign(bot, maxDistance, buildDeadline);
+        return {
+          ok: result.ok,
+          action: "run_task",
+          reason: result.reason,
+          detail: result.detail ?? (result.incomplete ? "incomplete" : result.ok ? result.reason : undefined)
+        };
+      }
+      case "strip_mine": {
+        const segments = Math.max(1, Math.min(amount, 32));
+        const result = await stripMineFromHere(bot, {
+          segments,
+          deadline,
+          resume: options.target === "resume",
+          continuous: options.target !== "finite"
+        });
+        return {
+          ok: result.ok,
+          action: "run_task",
+          reason: result.reason,
+          detail: result.detail ?? (result.ok ? result.reason : undefined)
+        };
+      }
+      case "mine_ores": {
+        const result = await minePendingOres(bot, deadline);
         return {
           ok: result.ok,
           action: "run_task",
@@ -159,6 +205,9 @@ export async function runBotTask(
 function defaultAmount(task: BotTaskName): number {
   if (task === "craft_tools" || task === "craft_survival" || task === "fight_mobs") {
     return 1;
+  }
+  if (task === "strip_mine") {
+    return Number(process.env.MC_STRIP_MINE_SEGMENTS ?? "6") || 6;
   }
   if (task === "gather_coal") {
     return Number(process.env.MC_TASK_COAL_AMOUNT ?? "4") || 4;

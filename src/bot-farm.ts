@@ -4,6 +4,7 @@ import { goals, Movements } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import {
   depositFarmItemsToNearestDoubleChest,
+  depositWheatToNearestDoubleChest,
   takeWheatSeedsFromNearbyChest
 } from "./bot-chest";
 import { abortActiveMining } from "./bot-gather";
@@ -11,6 +12,10 @@ import { isSleepRoutineActive } from "./bot-sleep";
 
 const WHEAT_AGE_MATURE = 7;
 const MAX_HARVEST_REACH = 4.5;
+const MAX_WHEAT_SCAN = 512;
+const HARVEST_LOG_EVERY = 8;
+const STASH_WHEAT_AT = 32;
+const PATH_ATTEMPTS_PER_PLOT = 3;
 
 export type CollectWheatResult = {
   ok: boolean;
@@ -25,10 +30,6 @@ let lastHarvestedPlots: Vec3[] = [];
 
 export function getLastHarvestedPlots(): Vec3[] {
   return lastHarvestedPlots.map((p) => p.clone());
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function posKey(pos: Vec3): string {
@@ -61,9 +62,12 @@ function countSeedsInInventory(bot: Bot): number {
   return bot.inventory.items().filter((i) => i.name === "wheat_seeds").reduce((n, i) => n + i.count, 0);
 }
 
-function collectBlockPlugin(bot: Bot) {
-  return (bot as Bot & { collectBlock?: { collect: (target: Block, options?: object) => Promise<void> } })
-    .collectBlock;
+function blockCenter(pos: Vec3): Vec3 {
+  return pos.offset(0.5, 0.5, 0.5);
+}
+
+function isInHarvestReach(bot: Bot, pos: Vec3): boolean {
+  return bot.entity.position.distanceTo(blockCenter(pos)) <= MAX_HARVEST_REACH;
 }
 
 function configureFarmMovements(bot: Bot): void {
@@ -96,82 +100,195 @@ async function waitForGoal(bot: Bot, timeoutMs: number): Promise<void> {
 }
 
 async function pathNearBlock(bot: Bot, pos: Vec3, timeoutMs: number): Promise<boolean> {
-  if (bot.entity.position.distanceTo(pos.offset(0.5, 0.5, 0.5)) <= MAX_HARVEST_REACH) {
+  if (isInHarvestReach(bot, pos)) {
     return true;
   }
   configureFarmMovements(bot);
-  bot.pathfinder.setGoal(new goals.GoalNear(pos.x, pos.y, pos.z, 1.2));
+  const goal = new goals.GoalGetToBlock(pos.x, pos.y, pos.z);
+  bot.pathfinder.setGoal(goal);
   try {
-    await waitForGoal(bot, timeoutMs);
+    await Promise.race([
+      bot.pathfinder.goto(goal),
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error("timeout")), timeoutMs))
+    ]);
     bot.pathfinder.setGoal(null);
-    return true;
+    return isInHarvestReach(bot, pos);
   } catch {
     bot.pathfinder.setGoal(null);
-    return false;
+    return isInHarvestReach(bot, pos);
   }
 }
 
-async function pickupDropsNear(bot: Bot, near: Vec3): Promise<void> {
-  const item = bot.nearestEntity((entity) => {
-    if (!entity.position || entity === bot.entity || entity.name !== "item") {
-      return false;
+async function pickupFarmDrops(bot: Bot, maxDistance: number, deadline: number): Promise<void> {
+  for (let round = 0; round < 24 && Date.now() < deadline; round++) {
+    const drop = bot.nearestEntity((entity) => {
+      if (entity.name !== "item" || !entity.position || entity === bot.entity) {
+        return false;
+      }
+      return entity.position.distanceTo(bot.entity.position) <= maxDistance;
+    });
+    if (!drop?.position) {
+      return;
     }
-    return entity.position.distanceTo(near.offset(0.5, 0.5, 0.5)) <= 4;
-  });
-  if (!item?.position) {
-    return;
-  }
-  const t = item.position;
-  if (bot.entity.position.distanceTo(t) <= 2) {
-    return;
-  }
-  configureFarmMovements(bot);
-  bot.pathfinder.setGoal(new goals.GoalNear(t.x, t.y, t.z, 0.8));
-  try {
-    await waitForGoal(bot, 5000);
-  } catch {
-    // pickup may still happen while walking
-  }
-  bot.pathfinder.setGoal(null);
-}
-
-async function harvestWheatBlock(bot: Bot, block: Block): Promise<boolean> {
-  const collector = collectBlockPlugin(bot);
-  if (collector) {
+    if (bot.entity.position.distanceTo(drop.position) <= 1.8) {
+      await delay(250);
+      continue;
+    }
+    configureFarmMovements(bot);
+    bot.pathfinder.setGoal(new goals.GoalNear(drop.position.x, drop.position.y, drop.position.z, 0.6));
     try {
-      abortActiveMining(bot);
-      await collector.collect(block, { ignoreNoPath: false, count: 1 });
-      return true;
+      await waitForGoal(bot, 4000);
     } catch {
-      // fall through to manual dig
+      // may still pick up while moving
     }
+    bot.pathfinder.setGoal(null);
   }
+}
 
-  abortActiveMining(bot);
-  if (!(await pathNearBlock(bot, block.position, 15_000))) {
-    return false;
-  }
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  const current = bot.blockAt(block.position);
+async function quickHarvestWheatAt(bot: Bot, pos: Vec3): Promise<boolean> {
+  const current = bot.blockAt(pos);
   if (!isMatureWheat(current)) {
     return false;
   }
 
   try {
-    await bot.unequip("hand");
-  } catch {
-    // non-fatal
-  }
-
-  await bot.lookAt(current.position.offset(0.5, 0.5, 0.5), true);
-  try {
+    await bot.lookAt(current.position.offset(0.5, 0.5, 0.5), true);
     await bot.dig(current);
-    await delay(200);
-    await pickupDropsNear(bot, current.position);
-    return true;
+    return !isMatureWheat(bot.blockAt(pos));
   } catch {
     return false;
   }
+}
+
+function sortPositionsByDistance(positions: Vec3[], from: Vec3): void {
+  positions.sort(
+    (a, b) => from.distanceTo(blockCenter(a)) - from.distanceTo(blockCenter(b))
+  );
+}
+
+function mergeMatureWheatTargets(
+  bot: Bot,
+  maxDistance: number,
+  queue: Vec3[],
+  harvested: Set<string>,
+  queued: Set<string>
+): number {
+  const found = findMatureWheatPositions(bot, maxDistance);
+  let added = 0;
+  for (const pos of found) {
+    const key = posKey(pos);
+    if (harvested.has(key) || queued.has(key)) {
+      continue;
+    }
+    if (!isMatureWheat(bot.blockAt(pos))) {
+      continue;
+    }
+    queue.push(pos.clone());
+    queued.add(key);
+    added += 1;
+  }
+  return added;
+}
+
+async function maybeStashHarvestedWheat(bot: Bot, maxDistance: number): Promise<void> {
+  if (countWheatItems(bot) < STASH_WHEAT_AT) {
+    return;
+  }
+  const deposit = await depositWheatToNearestDoubleChest(bot, maxDistance);
+  if ((deposit.moved ?? 0) > 0) {
+    console.log(`[farm] stashed ${deposit.moved} wheat mid-harvest`);
+  }
+}
+
+async function harvestMatureWheatBatch(
+  bot: Bot,
+  maxDistance: number,
+  deadline: number
+): Promise<{ blocksBroken: number; harvestedPlots: Vec3[]; lastError: string }> {
+  const harvested = new Set<string>();
+  const queued = new Set<string>();
+  const pathAttempts = new Map<string, number>();
+  const positions: Vec3[] = [];
+  const harvestedPlots: Vec3[] = [];
+  let blocksBroken = 0;
+  let lastError = "";
+
+  let added = mergeMatureWheatTargets(bot, maxDistance, positions, harvested, queued);
+  console.log(`[farm] found ${added} mature wheat plant(s) to harvest`);
+
+  while (Date.now() < deadline && !isSleepRoutineActive()) {
+    if (positions.length === 0) {
+      added = mergeMatureWheatTargets(bot, maxDistance, positions, harvested, queued);
+      if (added === 0) {
+        break;
+      }
+      console.log(`[farm] found ${added} more mature wheat plant(s)`);
+    }
+
+    sortPositionsByDistance(positions, bot.entity.position);
+    let harvestedThisRound = 0;
+
+    for (let i = positions.length - 1; i >= 0; i--) {
+      const pos = positions[i]!;
+      if (!isInHarvestReach(bot, pos)) {
+        continue;
+      }
+      if (await quickHarvestWheatAt(bot, pos)) {
+        const key = posKey(pos);
+        blocksBroken += 1;
+        harvestedThisRound += 1;
+        harvestedPlots.push(pos.clone());
+        harvested.add(key);
+        queued.delete(key);
+        positions.splice(i, 1);
+        if (blocksBroken % HARVEST_LOG_EVERY === 0) {
+          console.log(`[farm] harvested ${blocksBroken} wheat plant(s)…`);
+        }
+        await maybeStashHarvestedWheat(bot, maxDistance);
+      }
+    }
+
+    if (harvestedThisRound > 0) {
+      continue;
+    }
+
+    const next = positions[0];
+    if (!next) {
+      continue;
+    }
+
+    if (!isMatureWheat(bot.blockAt(next))) {
+      const key = posKey(next);
+      harvested.add(key);
+      queued.delete(key);
+      positions.shift();
+      continue;
+    }
+
+    const key = posKey(next);
+    if (!(await pathNearBlock(bot, next, 8000))) {
+      lastError = `Could not reach wheat at (${next.x},${next.y},${next.z})`;
+      const tries = (pathAttempts.get(key) ?? 0) + 1;
+      pathAttempts.set(key, tries);
+      if (tries >= PATH_ATTEMPTS_PER_PLOT) {
+        harvested.add(key);
+        queued.delete(key);
+        positions.shift();
+      } else {
+        positions.push(positions.shift()!);
+      }
+      continue;
+    }
+    pathAttempts.delete(key);
+  }
+
+  await pickupFarmDrops(bot, maxDistance, deadline);
+
+  return { blocksBroken, harvestedPlots, lastError };
 }
 
 function findMatureWheatPositions(bot: Bot, maxDistance: number): Vec3[] {
@@ -183,7 +300,7 @@ function findMatureWheatPositions(bot: Bot, maxDistance: number): Vec3[] {
   return findBlocks.call(bot, {
     matching: isMatureWheat,
     maxDistance,
-    count: 128
+    count: MAX_WHEAT_SCAN
   });
 }
 
@@ -245,55 +362,94 @@ function dedupePlots(plots: Vec3[]): Vec3[] {
 }
 
 async function equipWheatSeeds(bot: Bot): Promise<boolean> {
+  if (bot.heldItem?.name === "wheat_seeds") {
+    return true;
+  }
   const stack = bot.inventory.items().find((i) => i.name === "wheat_seeds");
   if (!stack) {
     return false;
   }
   await bot.equip(stack, "hand");
-  await delay(120);
   return bot.heldItem?.name === "wheat_seeds";
 }
 
-async function plantSeedAtPlot(bot: Bot, plotPos: Vec3): Promise<boolean> {
-  if (!isPlantablePlot(bot, plotPos)) {
+async function plantSeedInReach(bot: Bot, plotPos: Vec3): Promise<boolean> {
+  if (!isPlantablePlot(bot, plotPos) || countSeedsInInventory(bot) === 0) {
     return false;
   }
-  if (countSeedsInInventory(bot) === 0) {
+  if (!isInHarvestReach(bot, plotPos)) {
     return false;
   }
-  if (!(await equipWheatSeeds(bot))) {
+  if (bot.heldItem?.name !== "wheat_seeds" && !(await equipWheatSeeds(bot))) {
     return false;
   }
 
   const farmland = bot.blockAt(plotPos.offset(0, -1, 0));
-  if (!farmland) {
+  if (!farmland || farmland.name !== "farmland") {
     return false;
   }
 
-  if (!(await pathNearBlock(bot, farmland.position, 12_000))) {
-    return false;
-  }
-
-  const ground = bot.blockAt(farmland.position);
   const air = bot.blockAt(plotPos);
-  if (!ground || ground.name !== "farmland" || !air || air.name !== "air") {
+  if (!air || air.name !== "air") {
     return false;
   }
 
-  await bot.lookAt(ground.position.offset(0.5, 1, 0.5), true);
+  await bot.lookAt(farmland.position.offset(0.5, 1, 0.5), true);
   try {
-    await bot.placeBlock(ground, new Vec3(0, 1, 0));
-    await delay(100);
-    const planted = bot.blockAt(plotPos);
-    if (planted?.name === "wheat") {
-      console.log(`[farm] planted wheat seeds at (${plotPos.x},${plotPos.y},${plotPos.z})`);
-      return true;
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(`[farm] plant failed at (${plotPos.x},${plotPos.y},${plotPos.z}): ${msg}`);
+    await bot.placeBlock(farmland, new Vec3(0, 1, 0));
+    return bot.blockAt(plotPos)?.name === "wheat";
+  } catch {
+    return false;
   }
-  return false;
+}
+
+async function plantSeedsBatch(bot: Bot, plots: Vec3[], deadline: number): Promise<number> {
+  const remaining = [...plots];
+  let planted = 0;
+  let skipStreak = 0;
+
+  if (!(await equipWheatSeeds(bot))) {
+    return 0;
+  }
+
+  while (remaining.length > 0 && Date.now() < deadline && !isSleepRoutineActive()) {
+    let plantedThisRound = 0;
+
+    for (let i = remaining.length - 1; i >= 0; i--) {
+      const plot = remaining[i]!;
+      if (countSeedsInInventory(bot) === 0) {
+        return planted;
+      }
+      if (await plantSeedInReach(bot, plot)) {
+        planted += 1;
+        plantedThisRound += 1;
+        remaining.splice(i, 1);
+      }
+    }
+
+    if (plantedThisRound > 0) {
+      skipStreak = 0;
+      continue;
+    }
+
+    sortPositionsByDistance(remaining, bot.entity.position);
+    const next = remaining[0]!;
+    if (!isPlantablePlot(bot, next)) {
+      remaining.shift();
+      continue;
+    }
+    if (!(await pathNearBlock(bot, next, 6000))) {
+      skipStreak += 1;
+      remaining.shift();
+      if (skipStreak >= 4) {
+        break;
+      }
+      continue;
+    }
+    skipStreak = 0;
+  }
+
+  return planted;
 }
 
 /**
@@ -329,18 +485,7 @@ export async function plantWheatAtFarm(
 
   console.log(`[farm] planting on ${plots.length} plot(s) — ${seedsHave} seed(s) in inventory`);
 
-  let planted = 0;
-  for (const plot of plots) {
-    if (Date.now() >= deadline || isSleepRoutineActive()) {
-      break;
-    }
-    if (countSeedsInInventory(bot) === 0) {
-      break;
-    }
-    if (await plantSeedAtPlot(bot, plot)) {
-      planted += 1;
-    }
-  }
+  const planted = await plantSeedsBatch(bot, plots, deadline);
 
   if (planted === 0) {
     return { ok: false, reason: "Could not plant wheat — stand closer to the farm." };
@@ -356,8 +501,8 @@ export async function plantWheatAtFarm(
  */
 export async function collectWheatAndStash(
   bot: Bot,
-  maxDistance = 48,
-  deadline = Date.now() + 120_000
+  maxDistance = 64,
+  deadline = Date.now() + 300_000
 ): Promise<CollectWheatResult> {
   if (isSleepRoutineActive()) {
     return { ok: false, reason: "paused — owner is sleeping" };
@@ -366,50 +511,18 @@ export async function collectWheatAndStash(
   abortActiveMining(bot);
   bot.pathfinder.setGoal(null);
 
-  const origin = wheatSearchOrigin(bot);
-  const harvestedPlots: Vec3[] = [];
-  let blocksBroken = 0;
-  let lastError = "";
-
   console.log(`[farm] collecting mature wheat within ${maxDistance}m`);
 
-  const harvestDeadline = deadline - 30_000;
-  while (Date.now() < harvestDeadline) {
-    if (isSleepRoutineActive()) {
-      break;
-    }
+  const harvestDeadline = deadline - 60_000;
 
-    const positions = findMatureWheatPositions(bot, maxDistance);
-    if (positions.length === 0) {
-      break;
-    }
+  const { blocksBroken, harvestedPlots, lastError } = await harvestMatureWheatBatch(
+    bot,
+    maxDistance,
+    harvestDeadline
+  );
 
-    positions.sort((a, b) => {
-      const da = origin.distanceTo(a.offset(0.5, 0.5, 0.5));
-      const db = origin.distanceTo(b.offset(0.5, 0.5, 0.5));
-      return da - db;
-    });
-
-    const pos = positions[0]!;
-    const block = bot.blockAt(pos);
-    if (!isMatureWheat(block)) {
-      break;
-    }
-
-    const wheatBefore = countWheatItems(bot);
-    if (await harvestWheatBlock(bot, block)) {
-      blocksBroken += 1;
-      harvestedPlots.push(pos.clone());
-      const gained = countWheatItems(bot) - wheatBefore;
-      console.log(
-        `[farm] harvested wheat at (${pos.x},${pos.y},${pos.z})` +
-          (gained > 0 ? ` (+${gained})` : "")
-      );
-    } else {
-      lastError = `Could not reach wheat at (${pos.x},${pos.y},${pos.z})`;
-      console.log(`[farm] ${lastError}`);
-      break;
-    }
+  if (blocksBroken > 0) {
+    console.log(`[farm] harvested ${blocksBroken} wheat plant(s)`);
   }
 
   lastHarvestedPlots = dedupePlots(harvestedPlots);

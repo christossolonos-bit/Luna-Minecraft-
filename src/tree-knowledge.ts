@@ -2,6 +2,28 @@ import { Bot } from "mineflayer";
 import { Block } from "prismarine-block";
 import { Vec3 } from "vec3";
 
+/** How far Luna can chop from her feet (matches bot-tree MAX_DIG_REACH). */
+export const AXE_REACH_BLOCKS = 4.5;
+/** Extra blocks scanned above axe reach to find true tree tops. */
+export const SCAN_ABOVE_AXE_REACH = 10;
+
+function feetBlockY(bot: Bot): number {
+  return Math.floor(bot.entity.position.y - 0.01) - 1;
+}
+
+/** Highest world Y to scan from the bot's current stand (axe reach + headroom). */
+export function axeScanTopFromBot(bot: Bot): number {
+  return feetBlockY(bot) + Math.ceil(AXE_REACH_BLOCKS) + SCAN_ABOVE_AXE_REACH;
+}
+
+/** Dynamic scan ceiling: profile height, measured trunk, and 10 blocks above axe. */
+export function effectiveLogScanTopY(bot: Bot, tree: DetectedTree): number {
+  const profileTop = tree.trunk.y + tree.maxScanHeight;
+  const fromBot = axeScanTopFromBot(bot);
+  const fromMeasured = tree.trunk.y + tree.measuredHeight + SCAN_ABOVE_AXE_REACH;
+  return Math.max(profileTop, fromBot, fromMeasured);
+}
+
 export type TrunkShape = "1x1" | "2x2" | "branching";
 
 export type TreeProfile = {
@@ -252,18 +274,19 @@ function measureTree(
   anchor: Vec3,
   logType: string,
   scanRadius: number,
-  maxScanHeight: number
+  profileMaxHeight: number
 ): { height: number; logCount: number; minY: number; maxY: number } {
   let minY = anchor.y;
   let maxY = anchor.y;
   let logCount = 0;
+  const ceiling = Math.max(anchor.y + profileMaxHeight, axeScanTopFromBot(bot));
 
   for (let x = -scanRadius; x <= scanRadius; x++) {
     for (let z = -scanRadius; z <= scanRadius; z++) {
       if (new Vec3(x, 0, z).distanceTo(new Vec3(0, 0, 0)) > scanRadius) {
         continue;
       }
-      for (let y = anchor.y; y <= anchor.y + maxScanHeight; y++) {
+      for (let y = anchor.y; y <= ceiling; y++) {
         const block = bot.blockAt(new Vec3(anchor.x + x, y, anchor.z + z));
         if (!block || !isLogBlockName(block.name) || !sameLogFamily(block.name, logType)) {
           continue;
@@ -390,9 +413,13 @@ export function detectTree(bot: Bot, logBlock: Block): DetectedTree | null {
     : trunkShape === "2x2"
       ? Math.max(profile.scanRadius, 2)
       : profile.scanRadius;
-  const maxScanHeight = isGiant
-    ? (profile.giantMaxScanHeight ?? profile.maxScanHeight)
-    : profile.maxScanHeight;
+  const maxScanHeight = Math.max(
+    isGiant
+      ? (profile.giantMaxScanHeight ?? profile.maxScanHeight)
+      : profile.maxScanHeight,
+    measured.maxY - trunk.y + SCAN_ABOVE_AXE_REACH,
+    axeScanTopFromBot(bot) - trunk.y
+  );
 
   const leafType = detectLeafType(bot, trunk, profile, scanRadius);
   const description = buildDescription(
@@ -430,13 +457,14 @@ export function scanTreeLogs(
   const seen = new Set<string>();
   const logs: Vec3[] = [];
   const r = tree.scanRadius;
+  const topY = effectiveLogScanTopY(bot, tree);
 
   for (let x = -r; x <= r; x++) {
     for (let z = -r; z <= r; z++) {
       if (new Vec3(x, 0, z).distanceTo(new Vec3(0, 0, 0)) > r) {
         continue;
       }
-      for (let y = baseY; y <= anchor.y + tree.maxScanHeight; y++) {
+      for (let y = baseY; y <= topY; y++) {
         const block = bot.blockAt(new Vec3(anchor.x + x, y, anchor.z + z));
         if (!block || !isLogBlockName(block.name) || !sameLogFamily(block.name, tree.logType)) {
           continue;
@@ -464,10 +492,21 @@ export function isTreeLeafBlock(block: Block, tree: DetectedTree): boolean {
   return block.name.endsWith("_leaves");
 }
 
+/** Snow layers on snowy-biome trees, plus leaves that block the trunk. */
+export function isTrunkFoliageBlock(block: Block, tree: DetectedTree): boolean {
+  if (!block || block.name === "air") {
+    return false;
+  }
+  if (block.name === "snow" || block.name === "snow_block") {
+    return true;
+  }
+  return isTreeLeafBlock(block, tree);
+}
+
 /** Leaf blocks on and beside trunk columns (low spruce foliage, etc.). */
 export function scanTrunkLeaves(bot: Bot, tree: DetectedTree): Vec3[] {
   const baseY = tree.trunk.y;
-  const maxY = tree.trunk.y + tree.maxScanHeight;
+  const maxY = effectiveLogScanTopY(bot, tree);
   const seen = new Set<string>();
   const leaves: Vec3[] = [];
   const pad = tree.trunkShape === "2x2" ? 1 : 1;
@@ -485,7 +524,7 @@ export function scanTrunkLeaves(bot: Bot, tree: DetectedTree): Vec3[] {
             continue;
           }
           const block = bot.blockAt(pos);
-          if (!block || !isTreeLeafBlock(block, tree)) {
+          if (!block || !isTrunkFoliageBlock(block, tree)) {
             continue;
           }
           seen.add(key);
@@ -502,9 +541,10 @@ export function countLeavesNear(bot: Bot, tree: DetectedTree): number {
   const anchor = tree.trunk;
   let count = 0;
   const r = tree.scanRadius + 1;
+  const maxY = effectiveLogScanTopY(bot, tree) - anchor.y;
 
   for (let x = -r; x <= r; x++) {
-    for (let y = 0; y <= tree.maxScanHeight; y++) {
+    for (let y = 0; y <= maxY; y++) {
       for (let z = -r; z <= r; z++) {
         const block = bot.blockAt(anchor.offset(x, y, z));
         if (!block || block.name === "air") {
@@ -521,4 +561,65 @@ export function countLeavesNear(bot: Bot, tree: DetectedTree): number {
 
 export function preferredStandColumn(tree: DetectedTree): Vec3 {
   return tree.trunkColumns[0] ?? tree.trunk;
+}
+
+const LOG_TO_SAPLING: Record<string, string> = {
+  oak_log: "oak_sapling",
+  birch_log: "birch_sapling",
+  spruce_log: "spruce_sapling",
+  jungle_log: "jungle_sapling",
+  acacia_log: "acacia_sapling",
+  dark_oak_log: "dark_oak_sapling",
+  cherry_log: "cherry_sapling",
+  mangrove_log: "mangrove_propagule"
+};
+
+/** Chest item to replant this tree type (null for nether stems, etc.). */
+export function saplingItemForTree(tree: DetectedTree): string | null {
+  return LOG_TO_SAPLING[tree.logType] ?? null;
+}
+
+/** How many saplings to withdraw for a full replant. */
+export function saplingsNeededForTree(tree: DetectedTree): number {
+  if (tree.trunkShape !== "2x2") {
+    return 1;
+  }
+  const unique = new Set(tree.trunkColumns.map((c) => `${c.x},${c.z}`));
+  return Math.max(unique.size, 4);
+}
+
+/** Air-block positions where saplings should be placed (one per trunk column). */
+export function treePlantSites(tree: DetectedTree): Vec3[] {
+  const baseY = tree.trunk.y;
+  const seen = new Set<string>();
+  const sites: Vec3[] = [];
+
+  const add = (x: number, z: number) => {
+    const key = `${x},${z}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    sites.push(new Vec3(x, baseY, z));
+  };
+
+  if (tree.trunkShape === "2x2") {
+    if (tree.trunkColumns.length >= 4) {
+      for (const col of tree.trunkColumns) {
+        add(col.x, col.z);
+      }
+    } else {
+      const ax = tree.trunk.x;
+      const az = tree.trunk.z;
+      add(ax, az);
+      add(ax + 1, az);
+      add(ax, az + 1);
+      add(ax + 1, az + 1);
+    }
+    return sites;
+  }
+
+  const col = preferredStandColumn(tree);
+  add(col.x, col.z);
+  return sites;
 }

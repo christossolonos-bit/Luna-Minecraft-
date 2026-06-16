@@ -12,6 +12,7 @@
     "observe": "tsx examples/observe.ts",
     "luna:ai": "tsx examples/luna-ai.ts",
     "install:voice": "pip install -r requirements-voice.txt",
+    "voice:window": "python scripts/luna_voice_window.py",
     "install:client": "powershell -ExecutionPolicy Bypass -File scripts/install-luna-client.ps1",
     "start": "node dist/server.js",
     "lint": "tsc --noEmit",

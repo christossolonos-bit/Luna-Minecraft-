@@ -3,6 +3,7 @@ import { createWriteStream, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { UniversalEdgeTTS } from "edge-tts-universal";
+import { localTtsPlaybackEnabled, sendToVoiceWindow } from "./voice-window";
 
 export type McTtsConfig = {
   voice: string;
@@ -128,6 +129,10 @@ export async function playMp3(buffer: Buffer): Promise<void> {
 }
 
 export async function speak(text: string, config: McTtsConfig): Promise<void> {
+  await sendToVoiceWindow(text);
+  if (!localTtsPlaybackEnabled()) {
+    return;
+  }
   const audio = await synthesizeSpeech(text, config);
   await playMp3(audio);
 }

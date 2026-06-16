@@ -509,7 +509,7 @@ export async function replayGatherWoodTutorial(
       .join(", ")}) on ${tree.profile.label} at (${targetBase.x},${targetBase.y},${targetBase.z})`
   );
 
-  await approachTrunk(bot, targetBase, targetBase.y);
+  await approachTrunk(bot, targetBase, targetBase.y, tree);
 
   let done = 0;
   let skipped = 0;

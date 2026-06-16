@@ -37,7 +37,19 @@ export const LUNA_ABILITIES: LunaAbility[] = [
   {
     id: "gather_wood",
     name: "Chop a whole tree",
-    examples: ["gather wood — asks for axe if missing"]
+    examples: ["gather wood — chops a whole tree, stashes logs, replants saplings from chest"]
+  },
+  {
+    id: "strip_mine",
+    name: "Strip mine at your depth",
+    examples: [
+      "strip mine — continuous tunnel at your Y; says stop to halt; mine ores when she finds ore"
+    ]
+  },
+  {
+    id: "mine_ores",
+    name: "Mine marked ores",
+    examples: ["mine ores — digs ores she spotted, then continues strip mining"]
   },
   {
     id: "check_logs",
@@ -53,6 +65,13 @@ export const LUNA_ABILITIES: LunaAbility[] = [
     id: "plant_wheat",
     name: "Replant the farm",
     examples: ["plant wheat — takes seeds from chest and plants where she last harvested"]
+  },
+  {
+    id: "build_house",
+    name: "Build a starter cottage",
+    examples: [
+      "build house — place a sign at the center; cottage has porch, windows, door, peaked roof"
+    ]
   },
   {
     id: "sleep_with_owner",

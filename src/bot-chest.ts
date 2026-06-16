@@ -6,7 +6,8 @@ import {
   AXE_ITEM_NAMES,
   equipToolCategory,
   hasToolCategory,
-  PICKAXE_ITEM_NAMES
+  PICKAXE_ITEM_NAMES,
+  SHOVEL_ITEM_NAMES
 } from "./bot-inventory";
 
 const CHEST_BLOCKS = new Set(["chest", "trapped_chest"]);
@@ -446,15 +447,16 @@ function chestHasNamedItem(container: ChestWindow, names: string[]): string | nu
   return null;
 }
 
-/** Take one pickaxe or axe from a nearby chest and equip it. */
+/** Take one pickaxe, axe, or shovel from a nearby chest and equip it. */
 export async function takeToolFromNearbyChest(
   bot: Bot,
-  tool: "pickaxe" | "axe",
+  tool: "pickaxe" | "axe" | "shovel",
   maxDistance?: number
 ): Promise<DepositResult> {
   const radius = maxDistance ?? (Number(process.env.MC_CHEST_SEARCH_RADIUS ?? "48") || 48);
   const category = tool;
-  const names = tool === "pickaxe" ? PICKAXE_ITEM_NAMES : AXE_ITEM_NAMES;
+  const names =
+    tool === "pickaxe" ? PICKAXE_ITEM_NAMES : tool === "axe" ? AXE_ITEM_NAMES : SHOVEL_ITEM_NAMES;
 
   if (hasToolCategory(bot, category)) {
     const held = bot.inventory.items().find((i) => names.includes(i.name));
@@ -595,6 +597,175 @@ function chestItemCount(container: ChestWindow, itemName: string): number {
   return total;
 }
 
+const BUILD_BLOCK_NAMES = [
+  "oak_planks",
+  "spruce_planks",
+  "birch_planks",
+  "jungle_planks",
+  "acacia_planks",
+  "dark_oak_planks",
+  "mangrove_planks",
+  "cherry_planks",
+  "bamboo_planks",
+  "crimson_planks",
+  "warped_planks",
+  "cobblestone",
+  "stone_bricks"
+];
+
+function isBuildingBlock(name: string): boolean {
+  return BUILD_BLOCK_NAMES.includes(name);
+}
+
+/** Withdraw planks/cobble for building from nearby chests. */
+export async function takeBuildingBlocksFromNearbyChest(
+  bot: Bot,
+  count: number,
+  maxDistance?: number
+): Promise<DepositResult> {
+  const needed = Math.max(1, Math.floor(count));
+  const radius = maxDistance ?? (Number(process.env.MC_CHEST_SEARCH_RADIUS ?? "48") || 48);
+  const inInv = bot.inventory
+    .items()
+    .filter((i) => isBuildingBlock(i.name))
+    .reduce((n, i) => n + i.count, 0);
+  if (inInv >= needed) {
+    return { ok: true, moved: 0, reason: `already have ${inInv} building blocks` };
+  }
+
+  let stillNeed = needed - inInv;
+  const chests = await resolveChestsNear(bot, radius);
+  if (chests.length === 0) {
+    return { ok: false, reason: `No chest within ${radius} blocks.` };
+  }
+
+  let withdrawn = 0;
+  for (const chestBlock of chests) {
+    if (stillNeed <= 0) {
+      break;
+    }
+    const reached = await pathNearBlock(bot, chestBlock);
+    if (!reached) {
+      continue;
+    }
+
+    const container = await openChestSafely(bot, chestBlock);
+    if (!container) {
+      continue;
+    }
+
+    try {
+      for (const name of BUILD_BLOCK_NAMES) {
+        if (stillNeed <= 0) {
+          break;
+        }
+        const available = chestItemCount(container, name);
+        if (available <= 0) {
+          continue;
+        }
+        const itemId = bot.registry.itemsByName[name]?.id;
+        if (itemId == null) {
+          continue;
+        }
+        const take = Math.min(stillNeed, available);
+        try {
+          await container.withdraw(itemId, null, take);
+          withdrawn += take;
+          stillNeed -= take;
+          console.log(`[chest] took ${take} ${name.replace(/_/g, " ")} for building`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.log(`[chest] withdraw ${name} failed: ${msg}`);
+        }
+      }
+    } finally {
+      await container.close();
+    }
+  }
+
+  const total = bot.inventory
+    .items()
+    .filter((i) => isBuildingBlock(i.name))
+    .reduce((n, i) => n + i.count, 0);
+  if (withdrawn > 0 || total > inInv) {
+    return { ok: true, moved: withdrawn, reason: `took ${withdrawn} building block(s)` };
+  }
+
+  return { ok: false, reason: "No planks or cobblestone in nearby chests." };
+}
+
+/** Withdraw specific items for house building (planks, glass, doors, torches, etc.). */
+export async function takeHouseSuppliesFromNearbyChest(
+  bot: Bot,
+  needs: Map<string, number>,
+  maxDistance?: number
+): Promise<DepositResult> {
+  const radius = maxDistance ?? (Number(process.env.MC_CHEST_SEARCH_RADIUS ?? "48") || 48);
+  const chests = await resolveChestsNear(bot, radius);
+  if (chests.length === 0) {
+    return { ok: false, reason: `No chest within ${radius} blocks.` };
+  }
+
+  let withdrawn = 0;
+  for (const chestBlock of chests) {
+    let anyNeed = false;
+    for (const [name, need] of needs) {
+      const have = bot.inventory.items().filter((i) => i.name === name).reduce((n, i) => n + i.count, 0);
+      if (have < need) {
+        anyNeed = true;
+        break;
+      }
+    }
+    if (!anyNeed) {
+      break;
+    }
+
+    const reached = await pathNearBlock(bot, chestBlock);
+    if (!reached) {
+      continue;
+    }
+
+    const container = await openChestSafely(bot, chestBlock);
+    if (!container) {
+      continue;
+    }
+
+    try {
+      for (const [name, need] of needs) {
+        const have = bot.inventory.items().filter((i) => i.name === name).reduce((n, i) => n + i.count, 0);
+        const stillNeed = need - have;
+        if (stillNeed <= 0) {
+          continue;
+        }
+        const available = chestItemCount(container, name);
+        if (available <= 0) {
+          continue;
+        }
+        const itemId = bot.registry.itemsByName[name]?.id;
+        if (itemId == null) {
+          continue;
+        }
+        const take = Math.min(stillNeed, available);
+        try {
+          await container.withdraw(itemId, null, take);
+          withdrawn += take;
+          console.log(`[chest] took ${take} ${name.replace(/_/g, " ")} for house`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.log(`[chest] withdraw ${name} failed: ${msg}`);
+        }
+      }
+    } finally {
+      await container.close();
+    }
+  }
+
+  if (withdrawn > 0) {
+    return { ok: true, moved: withdrawn, reason: `took ${withdrawn} house supply item(s)` };
+  }
+  return { ok: false, reason: "Needed house supplies not found in chest." };
+}
+
 /** Withdraw wheat seeds from a nearby chest (doubles or singles). */
 export async function takeWheatSeedsFromNearbyChest(
   bot: Bot,
@@ -664,5 +835,173 @@ export async function takeWheatSeedsFromNearbyChest(
   return {
     ok: false,
     reason: `No wheat seeds in nearby chests — put seeds in the chest first.`
+  };
+}
+
+/** Withdraw tree saplings (or propagules) from a nearby chest. */
+export async function takeSaplingsFromNearbyChest(
+  bot: Bot,
+  saplingName: string,
+  count: number,
+  maxDistance?: number
+): Promise<DepositResult> {
+  const needed = Math.max(1, Math.floor(count));
+  const radius = maxDistance ?? (Number(process.env.MC_CHEST_SEARCH_RADIUS ?? "48") || 48);
+  const inInv = bot.inventory
+    .items()
+    .filter((i) => i.name === saplingName)
+    .reduce((n, i) => n + i.count, 0);
+  if (inInv >= needed) {
+    return { ok: true, moved: 0, reason: `already have ${inInv} ${saplingName.replace(/_/g, " ")}` };
+  }
+
+  let stillNeed = needed - inInv;
+  const chests = await resolveChestsNear(bot, radius);
+  if (chests.length === 0) {
+    return { ok: false, reason: `No chest within ${radius} blocks.` };
+  }
+
+  const itemId = bot.registry.itemsByName[saplingName]?.id;
+  if (itemId == null) {
+    return { ok: false, reason: `${saplingName} item not in registry.` };
+  }
+
+  let withdrawn = 0;
+  for (const chestBlock of chests) {
+    if (stillNeed <= 0) {
+      break;
+    }
+    const reached = await pathNearBlock(bot, chestBlock);
+    if (!reached) {
+      continue;
+    }
+
+    const container = await openChestSafely(bot, chestBlock);
+    if (!container) {
+      continue;
+    }
+
+    try {
+      const available = chestItemCount(container, saplingName);
+      if (available <= 0) {
+        continue;
+      }
+      const take = Math.min(stillNeed, available);
+      try {
+        await container.withdraw(itemId, null, take);
+        withdrawn += take;
+        stillNeed -= take;
+        console.log(
+          `[chest] took ${take} ${saplingName.replace(/_/g, " ")} from (${chestBlock.position.x},${chestBlock.position.y},${chestBlock.position.z})`
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log(`[chest] withdraw ${saplingName} failed: ${msg}`);
+      }
+    } finally {
+      await container.close();
+    }
+  }
+
+  const total = bot.inventory.items().filter((i) => i.name === saplingName).reduce((n, i) => n + i.count, 0);
+  if (withdrawn > 0 || total >= needed) {
+    return { ok: true, moved: withdrawn, reason: `took ${withdrawn || total} ${saplingName.replace(/_/g, " ")}` };
+  }
+
+  return {
+    ok: false,
+    reason: `No ${saplingName.replace(/_/g, " ")} in nearby chests — put saplings in the chest first.`
+  };
+}
+
+const SCAFFOLD_CHEST_ITEMS = [
+  "dirt",
+  "grass_block",
+  "coarse_dirt",
+  "rooted_dirt",
+  "cobblestone",
+  "stone"
+];
+
+function countScaffoldInInventory(bot: Bot): number {
+  return bot.inventory
+    .items()
+    .filter((i) => SCAFFOLD_CHEST_ITEMS.includes(i.name))
+    .reduce((n, i) => n + i.count, 0);
+}
+
+/** Withdraw dirt / scaffold blocks from a nearby chest (dirt first). */
+export async function takeScaffoldFromNearbyChest(
+  bot: Bot,
+  count: number,
+  maxDistance?: number
+): Promise<DepositResult> {
+  const needed = Math.max(1, Math.floor(count));
+  const radius = maxDistance ?? (Number(process.env.MC_CHEST_SEARCH_RADIUS ?? "48") || 48);
+  const inInv = countScaffoldInInventory(bot);
+  if (inInv >= needed) {
+    return { ok: true, moved: 0, reason: `already have ${inInv} scaffold block(s)` };
+  }
+
+  let stillNeed = needed - inInv;
+  const chests = await resolveChestsNear(bot, radius);
+  if (chests.length === 0) {
+    return { ok: false, reason: `No chest within ${radius} blocks.` };
+  }
+
+  let withdrawn = 0;
+  for (const chestBlock of chests) {
+    if (stillNeed <= 0) {
+      break;
+    }
+    const reached = await pathNearBlock(bot, chestBlock);
+    if (!reached) {
+      continue;
+    }
+
+    const container = await openChestSafely(bot, chestBlock);
+    if (!container) {
+      continue;
+    }
+
+    try {
+      for (const itemName of SCAFFOLD_CHEST_ITEMS) {
+        if (stillNeed <= 0) {
+          break;
+        }
+        const available = chestItemCount(container, itemName);
+        if (available <= 0) {
+          continue;
+        }
+        const itemId = bot.registry.itemsByName[itemName]?.id;
+        if (itemId == null) {
+          continue;
+        }
+        const take = Math.min(stillNeed, available);
+        try {
+          await container.withdraw(itemId, null, take);
+          withdrawn += take;
+          stillNeed -= take;
+          console.log(
+            `[chest] took ${take} ${itemName.replace(/_/g, " ")} for scaffold from (${chestBlock.position.x},${chestBlock.position.y},${chestBlock.position.z})`
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.log(`[chest] withdraw ${itemName} failed: ${msg}`);
+        }
+      }
+    } finally {
+      await container.close();
+    }
+  }
+
+  const total = countScaffoldInInventory(bot);
+  if (withdrawn > 0 || total >= needed) {
+    return { ok: true, moved: withdrawn, reason: `took ${withdrawn || total} scaffold block(s)` };
+  }
+
+  return {
+    ok: false,
+    reason: "No dirt or scaffold blocks in nearby chests."
   };
 }

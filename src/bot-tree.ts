@@ -4,17 +4,29 @@ import { goals, Movements } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { depositLogsToNearestDoubleChest } from "./bot-chest";
 import { abortActiveMining, digBlockInReach } from "./bot-gather";
-import { equipToolCategory } from "./bot-inventory";
+import { equipToolCategory, ToolCategory } from "./bot-inventory";
+import { addProtectedBlocksToMovements, blockInFrontOfBot, isProtectedFromBreaking, refuseProtectedDig } from "./bot-protect";
+import { replantTreeFromChest } from "./bot-tree-plant";
 import { isSleepRoutineActive } from "./bot-sleep";
 import {
+  AXE_REACH_BLOCKS,
   countLeavesNear,
   detectTree,
   DetectedTree,
+  effectiveLogScanTopY,
   isLogBlockName,
   preferredStandColumn,
+  SCAN_ABOVE_AXE_REACH,
+  isTrunkFoliageBlock,
   scanTreeLogs,
   scanTrunkLeaves
 } from "./tree-knowledge";
+import {
+  countScaffoldBlocks,
+  ensureScaffoldSupplies,
+  isScaffoldBlockName,
+  placeScaffoldStep
+} from "./bot-scaffold";
 import { getTreeChopRL, TreeChopSession } from "./tree-rl";
 
 const MAX_DIG_REACH = 4.5;
@@ -24,6 +36,7 @@ export type TreeChopResult = {
   reason?: string;
   logsCut?: number;
   stashed?: number;
+  planted?: number;
   treeType?: string;
   treeDescription?: string;
   rlPoints?: number;
@@ -166,6 +179,7 @@ function configureTreeMovements(bot: Bot): void {
   movements.allow1by1towers = false;
   movements.allowSprinting = true;
   movements.scafoldingBlocks = [];
+  addProtectedBlocksToMovements(bot, movements);
   bot.pathfinder.setMovements(movements);
 }
 
@@ -180,6 +194,27 @@ async function centerOnColumn(
     return;
   }
   stopPathfinding(bot);
+
+  const front = blockInFrontOfBot(bot);
+  if (front && isProtectedFromBreaking(front)) {
+    console.log(
+      `[protect] ${front.name.replace(/_/g, " ")} in front at (${front.position.x},${front.position.y},${front.position.z}) — pathing around`
+    );
+    configureTreeMovements(bot);
+    bot.pathfinder.setGoal(
+      new goals.GoalNear(columnX, bot.entity.position.y, columnZ, 0.9)
+    );
+    try {
+      await waitForGoal(bot, 10_000);
+    } catch {
+      // partial path still helps
+    }
+    stopPathfinding(bot);
+    if (isOnColumn(bot, columnX, columnZ)) {
+      return;
+    }
+  }
+
   const targetX = columnX + 0.5;
   const targetZ = columnZ + 0.5;
 
@@ -202,76 +237,288 @@ async function centerOnColumn(
   session?.noteWalkNear(bot, new Vec3(columnX, bot.entity.position.floored().y, columnZ));
 }
 
-/** Jump up one block — must end standing ON the block, not just a tiny hop. */
-async function mountPillarBlock(
+/** Wait until upward velocity peaks (best moment to place under feet). */
+async function waitForJumpApex(bot: Bot, maxMs = 450): Promise<void> {
+  const start = Date.now();
+  let wasRising = false;
+  while (Date.now() - start < maxMs) {
+    const vy = bot.entity.velocity.y;
+    if (vy > 0.08) {
+      wasRising = true;
+    }
+    if (wasRising && vy <= 0.02) {
+      return;
+    }
+    await delay(25);
+  }
+}
+
+/** Jump onto an existing pillar block (empty hand). */
+async function jumpUpOntoBlock(
   bot: Bot,
-  pillarPos: Vec3,
+  stepPos: Vec3,
   session?: TreeChopSession
 ): Promise<boolean> {
-  if (isStandingOnBlock(bot, pillarPos)) {
+  if (isStandingOnBlock(bot, stepPos)) {
     return true;
   }
 
-  const rl = getTreeChopRL();
-  const timings = rl.getTimings();
   const feetBefore = feetBlockY(bot);
+  const rl = getTreeChopRL();
+  const top = stepPos.offset(0.5, 1.02, 0.5);
 
   stopPathfinding(bot);
-  bot.clearControlStates();
-  await centerOnColumn(bot, pillarPos.x, pillarPos.z, session);
-  const top = pillarPos.offset(0.5, 1.01, 0.5);
+  try {
+    await bot.unequip("hand");
+  } catch {
+    // non-fatal
+  }
 
-  const mountJumpMs = Math.min(timings.mountJumpMs, 280);
-
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await bot.lookAt(top, true);
+  for (let attempt = 0; attempt < 6; attempt++) {
     bot.clearControlStates();
+    await bot.lookAt(top, true);
     bot.setControlState("jump", true);
-    await delay(mountJumpMs + attempt * 50);
+    await delay(120 + attempt * 15);
+    await waitForJumpApex(bot, 300);
+    await delay(30);
     bot.setControlState("jump", false);
-    await delay(timings.mountLandMs + 80);
-    if (isStandingOnBlock(bot, pillarPos)) {
-      bot.clearControlStates();
-      session?.notePillarMount(pillarPos);
-      rl.adaptTiming("mount", true, timings);
+    await delay(140);
+    if (isStandingOnBlock(bot, stepPos)) {
+      session?.notePillarMount(stepPos);
+      rl.adaptTiming("mount", true, rl.getTimings());
+      return true;
+    }
+    bot.setControlState("jump", true);
+    await delay(160);
+    bot.setControlState("jump", false);
+    await delay(120);
+    if (isStandingOnBlock(bot, stepPos)) {
+      session?.notePillarMount(stepPos);
+      rl.adaptTiming("mount", true, rl.getTimings());
       return true;
     }
   }
-  bot.clearControlStates();
 
+  bot.clearControlStates();
   if (feetBlockY(bot) <= feetBefore) {
-    session?.noteEmptyJumps(5, pillarPos);
+    session?.noteEmptyJumps(3, stepPos);
   }
   return false;
 }
 
-function nextStepCandidates(bot: Bot, columnX: number, columnZ: number): Vec3[] {
-  const feetY = feetBlockY(bot);
-  const stepY = feetY + 1;
-  const offsets = [
-    [0, 0],
-    [1, 0],
-    [-1, 0],
-    [0, 1],
-    [0, -1]
-  ];
-  const out: Vec3[] = [];
+/**
+ * Jump, place a log in the trunk column at jump height (on ground under feet), land on it.
+ */
+async function jumpPlaceLogStep(
+  bot: Bot,
+  columnX: number,
+  columnZ: number,
+  groundPos: Vec3,
+  stepPos: Vec3,
+  logType: string,
+  placedSteps: Vec3[],
+  session?: TreeChopSession
+): Promise<boolean> {
+  const feetBefore = feetBlockY(bot);
+  const rl = getTreeChopRL();
 
-  for (const [dx, dz] of offsets) {
-    const pos = new Vec3(columnX + dx, stepY, columnZ + dz);
-    const block = bot.blockAt(pos);
-    if (!isClimbStepBlock(block) || isStandingOnBlock(bot, pos)) {
-      continue;
-    }
-    out.push(pos);
+  if (isStandingOnBlock(bot, stepPos)) {
+    return true;
   }
 
-  out.sort((a, b) => {
-    const aCenter = a.x === columnX && a.z === columnZ ? 0 : 1;
-    const bCenter = b.x === columnX && b.z === columnZ ? 0 : 1;
-    return aCenter - bCenter;
-  });
-  return out;
+  const existing = bot.blockAt(stepPos);
+  if (existing && existing.name !== "air" && isOurPlacedStep(stepPos, placedSteps)) {
+    console.log(`[tree] jump up onto placed log at (${stepPos.x},${stepPos.y},${stepPos.z})`);
+    if (await jumpUpOntoBlock(bot, stepPos, session)) {
+      return true;
+    }
+  }
+
+  if (!(await equipLogInHand(bot, logType))) {
+    return false;
+  }
+
+  const ground = bot.blockAt(groundPos);
+  if (!ground || !isSolidGround(ground)) {
+    return false;
+  }
+
+  console.log(
+    `[tree] jump + place log under feet at (${stepPos.x},${stepPos.y},${stepPos.z})`
+  );
+
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await centerOnColumn(bot, columnX, columnZ, session);
+    await bot.lookAt(ground.position.offset(0.5, 1, 0.5), true);
+    bot.clearControlStates();
+    bot.setControlState("jump", true);
+    await delay(80 + attempt * 10);
+    await waitForJumpApex(bot, 350);
+
+    const stepBlock = bot.blockAt(stepPos);
+    if (!stepBlock || stepBlock.name === "air") {
+      try {
+        await bot.placeBlock(ground, new Vec3(0, 1, 0));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log(`[tree] jump-place failed: ${msg}`);
+      }
+    }
+
+    await delay(40);
+    bot.setControlState("jump", false);
+    await delay(80);
+
+    if (!isStandingOnBlock(bot, stepPos)) {
+      bot.setControlState("jump", true);
+      await delay(150);
+      bot.setControlState("jump", false);
+      await delay(120);
+    }
+
+    if (isStandingOnBlock(bot, stepPos)) {
+      if (!isOurPlacedStep(stepPos, placedSteps)) {
+        placedSteps.push(stepPos.clone());
+        session?.notePillarPlace(stepPos);
+        rl.adaptTiming("place", true, rl.getTimings());
+      }
+      session?.notePillarMount(stepPos);
+      rl.adaptTiming("mount", true, rl.getTimings());
+      return true;
+    }
+
+    if (feetBlockY(bot) > feetBefore) {
+      return true;
+    }
+  }
+
+  session?.noteJumpNoPlace(stepPos, "jump-place failed");
+  return feetBlockY(bot) > feetBefore;
+}
+
+/** Jump up one block — must gain height standing ON the block. */
+async function mountPillarBlock(
+  bot: Bot,
+  pillarPos: Vec3,
+  session?: TreeChopSession,
+  requireGain = true
+): Promise<boolean> {
+  const feetBefore = feetBlockY(bot);
+  if (isStandingOnBlock(bot, pillarPos)) {
+    return !requireGain;
+  }
+  await jumpUpOntoBlock(bot, pillarPos, session);
+  await delay(80);
+  const gained = feetBlockY(bot) > feetBefore;
+  return requireGain ? gained : gained || isStandingOnBlock(bot, pillarPos);
+}
+
+const SURFACE_SCAN_RADIUS = 4;
+const SURFACE_MAX_HOPS = 12;
+
+/** Scan ground around Luna for dirt/cobble/logs one block above her feet. */
+function scanSurfaceStepBlocks(
+  bot: Bot,
+  columnX: number,
+  columnZ: number,
+  _targetLogY?: number
+): Vec3[] {
+  const feetY = feetBlockY(bot);
+  const stepY = feetY + 1;
+  const botX = Math.floor(bot.entity.position.x);
+  const botZ = Math.floor(bot.entity.position.z);
+  const seen = new Set<string>();
+  const ranked: { pos: Vec3; score: number }[] = [];
+
+  const consider = (x: number, z: number) => {
+    const key = `${x},${stepY},${z}`;
+    if (seen.has(key) || isStandingOnBlock(bot, new Vec3(x, stepY, z))) {
+      return;
+    }
+    const block = bot.blockAt(new Vec3(x, stepY, z));
+    if (!isClimbStepBlock(block)) {
+      return;
+    }
+    const below = bot.blockAt(new Vec3(x, stepY - 1, z));
+    if (!below || below.name === "air" || below.boundingBox === "empty") {
+      return;
+    }
+    seen.add(key);
+    const distTrunk = Math.hypot(x - columnX, z - columnZ);
+    if (distTrunk > SURFACE_SCAN_RADIUS + 1) {
+      return;
+    }
+    const distBot = Math.hypot(bot.entity.position.x - (x + 0.5), bot.entity.position.z - (z + 0.5));
+    const preferScaffold = block && isScaffoldBlockName(block.name) ? -4 : 0;
+    const onColumn = x === columnX && z === columnZ ? -3 : 0;
+    ranked.push({
+      pos: new Vec3(x, stepY, z),
+      score: distTrunk * 8 + distBot + preferScaffold + onColumn
+    });
+  };
+
+  for (let dx = -SURFACE_SCAN_RADIUS; dx <= SURFACE_SCAN_RADIUS; dx++) {
+    for (let dz = -SURFACE_SCAN_RADIUS; dz <= SURFACE_SCAN_RADIUS; dz++) {
+      consider(columnX + dx, columnZ + dz);
+      consider(botX + dx, botZ + dz);
+    }
+  }
+
+  ranked.sort((a, b) => a.score - b.score);
+  return ranked.map((r) => r.pos);
+}
+
+/** Walk up existing dirt/cobble/logs around the trunk (multi-hop). */
+async function tryClimbSurfaceNearTrunk(
+  bot: Bot,
+  columnX: number,
+  columnZ: number,
+  session?: TreeChopSession,
+  targetLogY?: number
+): Promise<boolean> {
+  const startFeet = feetBlockY(bot);
+  let hops = 0;
+
+  while (hops < SURFACE_MAX_HOPS) {
+    const feetBefore = feetBlockY(bot);
+    const steps = scanSurfaceStepBlocks(bot, columnX, columnZ, targetLogY);
+    if (steps.length === 0) {
+      break;
+    }
+
+    let gained = false;
+    for (const pos of steps) {
+      const block = bot.blockAt(pos);
+      if (!block || block.name === "air") {
+        continue;
+      }
+      if (await mountPillarBlock(bot, pos, session, true)) {
+        console.log(`[tree] stepped onto ${block.name} at (${pos.x},${pos.y},${pos.z})`);
+        gained = true;
+        hops += 1;
+        break;
+      }
+    }
+
+    if (!gained) {
+      break;
+    }
+    if (targetLogY !== undefined && feetBlockY(bot) + MAX_DIG_REACH >= targetLogY + 0.5) {
+      break;
+    }
+    if (feetBlockY(bot) <= feetBefore) {
+      break;
+    }
+  }
+
+  if (feetBlockY(bot) > startFeet) {
+    console.log(`[tree] surface climb — feet y=${startFeet} → ${feetBlockY(bot)}`);
+  }
+  return feetBlockY(bot) > startFeet;
+}
+
+function nextStepCandidates(bot: Bot, columnX: number, columnZ: number): Vec3[] {
+  return scanSurfaceStepBlocks(bot, columnX, columnZ);
 }
 
 /** Jump onto dirt/logs/stone beside the trunk to get higher. */
@@ -279,19 +526,10 @@ async function tryStepUpNearTrunk(
   bot: Bot,
   columnX: number,
   columnZ: number,
-  session?: TreeChopSession
+  session?: TreeChopSession,
+  targetLogY?: number
 ): Promise<boolean> {
-  for (const pos of nextStepCandidates(bot, columnX, columnZ)) {
-    const block = bot.blockAt(pos);
-    if (!block) {
-      continue;
-    }
-    console.log(`[tree] stepping onto ${block.name} at (${pos.x},${pos.y},${pos.z})`);
-    if (await mountPillarBlock(bot, pos, session)) {
-      return true;
-    }
-  }
-  return false;
+  return tryClimbSurfaceNearTrunk(bot, columnX, columnZ, session, targetLogY);
 }
 
 /** Walk up leftover steps in the trunk column or beside it (dirt, logs, etc.). */
@@ -365,6 +603,282 @@ function waitForGoal(bot: Bot, timeoutMs: number): Promise<void> {
 
 const TRUNK_APPROACH_HORIZ_M = 2.5;
 
+const GROUND_COVER_NAMES = [
+  "short_grass",
+  "tall_grass",
+  "fern",
+  "large_fern",
+  "dead_bush",
+  "vine",
+  "snow"
+];
+
+type ApproachObstacleKind = "foliage" | "snow" | "side_log" | "pile";
+
+function isTrunkColumnAt(tree: DetectedTree, x: number, z: number): boolean {
+  return tree.trunkColumns.some((c) => c.x === x && c.z === z);
+}
+
+function isTrunkColumnLogBlock(block: Block, tree: DetectedTree): boolean {
+  if (!tree.profile.logNames.includes(block.name)) {
+    return false;
+  }
+  return isTrunkColumnAt(tree, block.position.x, block.position.z);
+}
+
+function classifyApproachObstacle(block: Block | null, tree: DetectedTree): ApproachObstacleKind | null {
+  if (!block || block.name === "air") {
+    return null;
+  }
+  if (isProtectedFromBreaking(block)) {
+    return null;
+  }
+  if (isTrunkColumnLogBlock(block, tree)) {
+    return null;
+  }
+  if (isSnowFoliageBlock(block) || block.name === "snow") {
+    return "snow";
+  }
+  if (isTrunkFoliageBlock(block, tree)) {
+    return "foliage";
+  }
+  if (tree.profile.logNames.includes(block.name)) {
+    return "side_log";
+  }
+  if (GROUND_COVER_NAMES.includes(block.name) || block.name.endsWith("_leaves")) {
+    return "foliage";
+  }
+  if (block.boundingBox !== "empty") {
+    return "pile";
+  }
+  return null;
+}
+
+function obstacleDigTool(block: Block, kind: ApproachObstacleKind): ToolCategory {
+  if (kind === "snow") {
+    return "shovel";
+  }
+  if (kind === "foliage" || kind === "side_log") {
+    return "axe";
+  }
+  if (
+    ["dirt", "grass_block", "gravel", "sand", "coarse_dirt", "rooted_dirt", "podzol"].includes(
+      block.name
+    )
+  ) {
+    return "shovel";
+  }
+  if (
+    ["cobblestone", "stone", "andesite", "diorite", "granite", "deepslate", "tuff"].includes(
+      block.name
+    )
+  ) {
+    return "pickaxe";
+  }
+  return "axe";
+}
+
+/** Workstations/storage beside the trunk — never break these when approaching. */
+function scanProtectedBesideTrunk(
+  bot: Bot,
+  tree: DetectedTree,
+  columnX: number,
+  columnZ: number
+): Block[] {
+  const minY = tree.trunk.y - 1;
+  const maxY = tree.trunk.y + 2;
+  const found: Block[] = [];
+  const seen = new Set<string>();
+
+  for (let dx = -2; dx <= 2; dx++) {
+    for (let dz = -2; dz <= 2; dz++) {
+      for (let y = minY; y <= maxY; y++) {
+        const block = bot.blockAt(new Vec3(columnX + dx, y, columnZ + dz));
+        if (!block || !isProtectedFromBreaking(block)) {
+          continue;
+        }
+        const key = posKeyVec(block.position);
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        found.push(block);
+      }
+    }
+  }
+  return found;
+}
+
+/** Tiles within trunk approach range, closest to the column first. */
+function approachStandCandidates(columnX: number, columnZ: number): Vec3[] {
+  const out: Vec3[] = [];
+  for (let dx = -2; dx <= 2; dx++) {
+    for (let dz = -2; dz <= 2; dz++) {
+      if (Math.hypot(dx, dz) > 2.5) {
+        continue;
+      }
+      out.push(new Vec3(columnX + dx, 0, columnZ + dz));
+    }
+  }
+  out.sort((a, b) => {
+    const da = Math.hypot(a.x - columnX, a.z - columnZ);
+    const db = Math.hypot(b.x - columnX, b.z - columnZ);
+    return da - db;
+  });
+  return out;
+}
+
+/** Floor, body-height foliage, snow, and side logs around the trunk and on the walk-in path. */
+function scanApproachObstacles(
+  bot: Bot,
+  tree: DetectedTree,
+  columnX: number,
+  columnZ: number
+): Vec3[] {
+  const anchorY = tree.trunk.y;
+  const minY = anchorY;
+  const maxY = anchorY + 3;
+  const radius = Math.max(3, tree.scanRadius + 1);
+  const seen = new Set<string>();
+  const ranked: { pos: Vec3; priority: number }[] = [];
+
+  const consider = (pos: Vec3, priority: number) => {
+    const key = posKeyVec(pos);
+    if (seen.has(key)) {
+      return;
+    }
+    const block = bot.blockAt(pos);
+    if (!classifyApproachObstacle(block, tree)) {
+      return;
+    }
+    seen.add(key);
+    ranked.push({ pos: pos.clone(), priority });
+  };
+
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dz = -radius; dz <= radius; dz++) {
+      if (Math.hypot(dx, dz) > radius + 0.5) {
+        continue;
+      }
+      for (let y = minY; y <= maxY; y++) {
+        consider(new Vec3(columnX + dx, y, columnZ + dz), 20 + y);
+      }
+    }
+  }
+
+  const botFeet = bot.entity.position.floored();
+  const steps = Math.max(Math.abs(columnX - botFeet.x), Math.abs(columnZ - botFeet.z), 1);
+  for (let i = 0; i <= steps; i++) {
+    const t = steps === 0 ? 0 : i / steps;
+    const x = Math.round(botFeet.x + t * (columnX - botFeet.x));
+    const z = Math.round(botFeet.z + t * (columnZ - botFeet.z));
+    for (let y = minY; y <= maxY; y++) {
+      consider(new Vec3(x, y, z), 5 + y);
+    }
+  }
+
+  ranked.sort(
+    (a, b) =>
+      a.priority - b.priority || distToBlock(bot, a.pos) - distToBlock(bot, b.pos)
+  );
+  return ranked.map((entry) => entry.pos);
+}
+
+async function digApproachObstacle(bot: Bot, block: Block, tree: DetectedTree): Promise<boolean> {
+  if (refuseProtectedDig(block, "approach obstacle")) {
+    return false;
+  }
+  const kind = classifyApproachObstacle(block, tree);
+  if (!kind) {
+    return false;
+  }
+  if (kind === "foliage" || kind === "snow") {
+    return digBlockingFoliage(bot, block);
+  }
+  if (distToBlock(bot, block.position) > MAX_DIG_REACH) {
+    return false;
+  }
+  const tool = obstacleDigTool(block, kind);
+  if (!(await equipToolCategory(bot, tool))) {
+    return false;
+  }
+  try {
+    await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true);
+    await bot.dig(block);
+    return foliageCleared(bot, block.position);
+  } catch {
+    return false;
+  }
+}
+
+async function pathNearStandTile(
+  bot: Bot,
+  tileX: number,
+  tileZ: number,
+  groundY: number
+): Promise<void> {
+  configureTreeMovements(bot);
+  bot.pathfinder.setGoal(new goals.GoalNear(tileX, groundY + 0.5, tileZ, 0.7));
+  try {
+    await waitForGoal(bot, 15_000);
+  } catch {
+    // partial path still helps
+  }
+  stopPathfinding(bot);
+}
+
+async function clearApproachObstacles(
+  bot: Bot,
+  tree: DetectedTree,
+  columnX: number,
+  columnZ: number,
+  maxBreaks = 16
+): Promise<number> {
+  let targets = scanApproachObstacles(bot, tree, columnX, columnZ);
+  if (targets.length === 0) {
+    return 0;
+  }
+
+  const sample = targets
+    .slice(0, 4)
+    .map((pos) => {
+      const block = bot.blockAt(pos);
+      return block ? `${block.name}@(${pos.x},${pos.y},${pos.z})` : `?@(${pos.x},${pos.y},${pos.z})`;
+    })
+    .join(", ");
+  console.log(
+    `[tree] approach scan: ${targets.length} blocker(s) on floor/tree near trunk — ${sample}${
+      targets.length > 4 ? "…" : ""
+    }`
+  );
+
+  const inReach = targets.filter((pos) => distToBlock(bot, pos) <= MAX_DIG_REACH);
+  if (inReach.length === 0) {
+    await pathNearStandTile(bot, columnX, columnZ, tree.trunk.y);
+    targets = scanApproachObstacles(bot, tree, columnX, columnZ);
+  }
+
+  let cleared = 0;
+  for (const pos of targets) {
+    if (cleared >= maxBreaks) {
+      break;
+    }
+    const block = bot.blockAt(pos);
+    if (!block || !classifyApproachObstacle(block, tree)) {
+      continue;
+    }
+    if (distToBlock(bot, pos) > MAX_DIG_REACH) {
+      continue;
+    }
+    if (await digApproachObstacle(bot, block, tree)) {
+      console.log(`[tree] cleared approach blocker ${block.name} at (${pos.x},${pos.y},${pos.z})`);
+      cleared += 1;
+      await delay(50);
+    }
+  }
+  return cleared;
+}
+
 /** Prefer trees near the owner when they are in-world (e.g. after tp to me). */
 function treeSearchOrigin(bot: Bot): Vec3 {
   const ownerName = (process.env.MC_OWNER ?? "").trim();
@@ -373,41 +887,95 @@ function treeSearchOrigin(bot: Bot): Vec3 {
 }
 
 /** Walk to the trunk once, stop pathfinder, then face the tree. */
-export async function approachTrunk(bot: Bot, column: Vec3, anchorY: number): Promise<boolean> {
+export async function approachTrunk(
+  bot: Bot,
+  column: Vec3,
+  anchorY: number,
+  tree?: DetectedTree
+): Promise<boolean> {
   stopPathfinding(bot);
+  const columnX = column.x;
+  const columnZ = column.z;
+  const atTrunk = (): boolean =>
+    horizontalDistToColumn(bot, columnX, columnZ) <= TRUNK_APPROACH_HORIZ_M;
 
-  if (horizontalDistToColumn(bot, column.x, column.z) <= TRUNK_APPROACH_HORIZ_M) {
-    await centerOnColumn(bot, column.x, column.z);
+  if (atTrunk()) {
+    await centerOnColumn(bot, columnX, columnZ);
     await bot.lookAt(column.offset(0.5, anchorY + 0.5, 0.5), true);
     return true;
   }
 
-  configureTreeMovements(bot);
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const y = bot.entity.position.y;
-    bot.pathfinder.setGoal(new goals.GoalNear(column.x, y, column.z, 1.2));
-    try {
-      await waitForGoal(bot, 20_000);
-    } catch {
-      // partial path still helps
+  if (tree) {
+    const workstations = scanProtectedBesideTrunk(bot, tree, columnX, columnZ);
+    if (workstations.length > 0) {
+      const sample = workstations
+        .slice(0, 3)
+        .map((b) => `${b.name.replace(/_/g, " ")}@(${b.position.x},${b.position.y},${b.position.z})`)
+        .join(", ");
+      console.log(
+        `[protect] workstation(s) beside trunk — will walk around, not break: ${sample}${
+          workstations.length > 3 ? "…" : ""
+        }`
+      );
     }
-    stopPathfinding(bot);
-    if (horizontalDistToColumn(bot, column.x, column.z) <= TRUNK_APPROACH_HORIZ_M) {
-      break;
+
+    for (let phase = 0; phase < 5 && !atTrunk(); phase++) {
+      const cleared = await clearApproachObstacles(bot, tree, columnX, columnZ, 14);
+      if (atTrunk()) {
+        break;
+      }
+
+      await pathNearStandTile(bot, columnX, columnZ, anchorY);
+      if (atTrunk()) {
+        break;
+      }
+
+      await centerOnColumn(bot, columnX, columnZ);
+      if (atTrunk()) {
+        break;
+      }
+
+      for (const tile of approachStandCandidates(columnX, columnZ)) {
+        if (atTrunk()) {
+          break;
+        }
+        await pathNearStandTile(bot, tile.x, tile.z, anchorY);
+        await clearApproachObstacles(bot, tree, columnX, columnZ, 6);
+        await centerOnColumn(bot, columnX, columnZ);
+      }
+
+      if (cleared === 0 && phase >= 2) {
+        break;
+      }
     }
+  } else {
+    configureTreeMovements(bot);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const y = bot.entity.position.y;
+      bot.pathfinder.setGoal(new goals.GoalNear(columnX, y, columnZ, 1.2));
+      try {
+        await waitForGoal(bot, 20_000);
+      } catch {
+        // partial path still helps
+      }
+      stopPathfinding(bot);
+      if (atTrunk()) {
+        break;
+      }
+    }
+    await centerOnColumn(bot, columnX, columnZ);
   }
 
-  await centerOnColumn(bot, column.x, column.z);
   await bot.lookAt(column.offset(0.5, anchorY + 0.5, 0.5), true);
 
-  const dist = horizontalDistToColumn(bot, column.x, column.z);
+  const dist = horizontalDistToColumn(bot, columnX, columnZ);
   if (dist <= TRUNK_APPROACH_HORIZ_M) {
-    console.log(`[tree] at trunk (${column.x},${column.z}) — ${dist.toFixed(1)}m away`);
+    console.log(`[tree] at trunk (${columnX},${columnZ}) — ${dist.toFixed(1)}m away`);
     return true;
   }
 
   console.log(
-    `[tree] cannot approach trunk at (${column.x},${column.z}) — ${dist.toFixed(1)}m away (need ≤${TRUNK_APPROACH_HORIZ_M}m)`
+    `[tree] cannot approach trunk at (${columnX},${columnZ}) — ${dist.toFixed(1)}m away (need ≤${TRUNK_APPROACH_HORIZ_M}m)`
   );
   return false;
 }
@@ -418,7 +986,7 @@ async function lookStraightUp(
   session?: TreeChopSession
 ): Promise<void> {
   const eye = bot.entity.position;
-  const lookY = eye.y + Math.min(tree.maxScanHeight, 20);
+  const lookY = Math.min(effectiveLogScanTopY(bot, tree), eye.y + 24);
   await bot.lookAt(new Vec3(eye.x, lookY, eye.z), true);
   session?.noteLookUp();
 }
@@ -426,11 +994,12 @@ async function lookStraightUp(
 function scanLogBlocks(bot: Bot, maxDistance: number): Block[] {
   const center = bot.entity.position.floored();
   const r = Math.min(Math.max(8, maxDistance), 64);
+  const maxYAbove = Math.ceil(AXE_REACH_BLOCKS) + SCAN_ABOVE_AXE_REACH + 8;
   const logs: Block[] = [];
   const seen = new Set<string>();
 
   for (let x = -r; x <= r; x++) {
-    for (let y = -2; y <= 32; y++) {
+    for (let y = -2; y <= maxYAbove; y++) {
       for (let z = -r; z <= r; z++) {
         const offset = new Vec3(x, y, z);
         if (offset.distanceTo(new Vec3(0, 0, 0)) > maxDistance) {
@@ -532,7 +1101,7 @@ async function equipLogInHand(bot: Bot, logType?: string): Promise<boolean> {
   return !!bot.heldItem && isLogItemName(bot.heldItem.name);
 }
 
-/** Step up existing solids in the trunk column. */
+/** Step up existing solids in the trunk column and nearby surface stacks. */
 async function mountColumnStack(
   bot: Bot,
   columnX: number,
@@ -541,6 +1110,10 @@ async function mountColumnStack(
   maxFeetY?: number
 ): Promise<boolean> {
   const startFeet = feetBlockY(bot);
+  if (await tryClimbSurfaceNearTrunk(bot, columnX, columnZ, session, maxFeetY)) {
+    return true;
+  }
+
   const ceiling = maxFeetY ?? startFeet + 14;
   const highest = highestSolidInColumn(bot, columnX, columnZ, startFeet + 1, ceiling + 1);
   if (highest <= startFeet) {
@@ -561,7 +1134,7 @@ async function mountColumnStack(
     if (!block || block.name === "air" || !isClimbStepBlock(block)) {
       break;
     }
-    if (!(await mountPillarBlock(bot, pos, session))) {
+    if (!(await mountPillarBlock(bot, pos, session, true))) {
       break;
     }
     progressed = true;
@@ -590,31 +1163,19 @@ async function pickupLogsNear(
   if (allowShuffle && itemEntity?.position) {
     const t = itemEntity.position;
     const dist = bot.entity.position.distanceTo(t);
-    if (dist > 2) {
-      stopPathfinding(bot);
-      configureTreeMovements(bot);
-      bot.pathfinder.setGoal(new goals.GoalNear(t.x, t.y, t.z, 0.8));
-      try {
-        await waitForGoal(bot, 5000);
-      } catch {
-        // may still be in pickup range
-      }
-      stopPathfinding(bot);
+    if (dist > 1.5) {
+      await delay(400);
     } else {
       await bot.lookAt(t, true);
-      bot.setControlState("forward", dist > 1);
-      await delay(300);
+      bot.setControlState("forward", dist > 0.8);
+      await delay(250);
       bot.clearControlStates();
     }
-    await delay(300);
+    await delay(200);
   } else {
-    await delay(500);
+    await delay(350);
   }
 
-  if (allowShuffle && distToBlock(bot, near) <= 3) {
-    await centerOnColumn(bot, near.x, near.z, session);
-    await delay(200);
-  }
   session?.noteWalkNear(bot, near);
 
   const gained = logCount(bot) - before;
@@ -787,35 +1348,107 @@ function scanChoppableLogs(bot: Bot, tree: DetectedTree, placedSteps: Vec3[]): V
   return scanTreeLogs(bot, tree).filter((p) => !skip.has(posKeyVec(p)));
 }
 
-/** Break reachable leaves on and beside the trunk so logs are accessible. */
-async function clearTrunkLeaves(bot: Bot, tree: DetectedTree, maxBreaks = 12): Promise<number> {
-  await equipToolCategory(bot, "axe");
-  const leaves = scanTrunkLeaves(bot, tree);
+function isSnowFoliageBlock(block: Block | null): boolean {
+  return !!block && (block.name === "snow" || block.name === "snow_block");
+}
+
+function foliageDigTool(block: Block): "axe" | "shovel" {
+  return isSnowFoliageBlock(block) ? "shovel" : "axe";
+}
+
+function foliageCleared(bot: Bot, pos: Vec3): boolean {
+  const block = bot.blockAt(pos);
+  return !block || block.name === "air";
+}
+
+/** Break snow or leaves in reach — direct dig (raycast often fails on snowy canopy). */
+async function digBlockingFoliage(bot: Bot, block: Block): Promise<boolean> {
+  if (refuseProtectedDig(block, "foliage clear")) {
+    return false;
+  }
+  if (distToBlock(bot, block.position) > MAX_DIG_REACH) {
+    return false;
+  }
+  const tool = foliageDigTool(block);
+  if (!(await equipToolCategory(bot, tool))) {
+    return false;
+  }
+  try {
+    await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true);
+    await bot.dig(block);
+    return foliageCleared(bot, block.position);
+  } catch {
+    return false;
+  }
+}
+
+/** Break reachable leaves and snow on/beside the trunk so logs are accessible. */
+function scanReachableTreeLeaves(
+  bot: Bot,
+  tree: DetectedTree,
+  columnX: number,
+  columnZ: number
+): Vec3[] {
+  const feetY = feetBlockY(bot);
+  const minY = Math.max(tree.trunk.y - 1, feetY - 1);
+  const maxY = effectiveLogScanTopY(bot, tree);
+  const pad = tree.trunkShape === "2x2" ? 2 : 2;
+  const seen = new Set<string>();
+  const foliage: Vec3[] = [];
+
+  for (let dx = -pad; dx <= pad; dx++) {
+    for (let dz = -pad; dz <= pad; dz++) {
+      for (let y = minY; y <= maxY; y++) {
+        const pos = new Vec3(columnX + dx, y, columnZ + dz);
+        const key = posKeyVec(pos);
+        if (seen.has(key) || distToBlock(bot, pos) > MAX_DIG_REACH) {
+          continue;
+        }
+        const block = bot.blockAt(pos);
+        if (!block || !isTrunkFoliageBlock(block, tree)) {
+          continue;
+        }
+        seen.add(key);
+        foliage.push(pos.clone());
+      }
+    }
+  }
+
+  foliage.sort(
+    (a, b) => b.y - a.y || distToBlock(bot, a) - distToBlock(bot, b)
+  );
+  return foliage;
+}
+
+async function clearTrunkLeaves(
+  bot: Bot,
+  tree: DetectedTree,
+  maxBreaks = 12,
+  column?: { x: number; z: number }
+): Promise<number> {
+  const targets = column
+    ? scanReachableTreeLeaves(bot, tree, column.x, column.z)
+    : scanTrunkLeaves(bot, tree).filter((p) => distToBlock(bot, p) <= MAX_DIG_REACH);
   let cleared = 0;
 
-  for (const pos of leaves) {
+  for (const pos of targets) {
     if (cleared >= maxBreaks) {
       break;
     }
-    if (distToBlock(bot, pos) > MAX_DIG_REACH) {
-      continue;
-    }
     const block = bot.blockAt(pos);
-    if (!block || block.name === "air") {
+    if (!block || !isTrunkFoliageBlock(block, tree)) {
       continue;
     }
-    try {
-      await digBlockInReach(bot, block, { tool: "axe" });
-      console.log(`[tree] cleared leaf ${block.name} at (${pos.x},${pos.y},${pos.z})`);
+    if (await digBlockingFoliage(bot, block)) {
+      const label = isSnowFoliageBlock(block) ? "snow" : "leaf";
+      console.log(`[tree] cut ${label} ${block.name} at (${pos.x},${pos.y},${pos.z})`);
       cleared += 1;
-      await delay(80);
-    } catch {
-      // leaf may be out of reach after another break
+      await delay(50);
     }
   }
 
   if (cleared > 0) {
-    console.log(`[tree] cleared ${cleared} leaf block(s) around trunk`);
+    console.log(`[tree] cut ${cleared} block(s) blocking the trunk`);
   }
   return cleared;
 }
@@ -825,16 +1458,27 @@ async function clearPillarObstruction(bot: Bot, pos: Vec3): Promise<void> {
   if (!block || block.name === "air" || isLogBlockName(block.name) || !isPillarReplaceable(block)) {
     return;
   }
+  if (refuseProtectedDig(block, "pillar step")) {
+    return;
+  }
   if (distToBlock(bot, pos) > MAX_DIG_REACH) {
     return;
   }
-  try {
-    await equipToolCategory(bot, "axe");
-    await digBlockInReach(bot, block, { tool: "axe" });
+  const cleared =
+    isSnowFoliageBlock(block) || block.name.endsWith("_leaves")
+      ? await digBlockingFoliage(bot, block)
+      : await (async () => {
+          try {
+            await equipToolCategory(bot, "axe");
+            await digBlockInReach(bot, block, { tool: "axe" });
+            return foliageCleared(bot, pos);
+          } catch {
+            return false;
+          }
+        })();
+  if (cleared) {
     console.log(`[tree] cleared ${block.name} at (${pos.x},${pos.y},${pos.z}) for pillar`);
     await delay(150);
-  } catch {
-    // non-fatal
   }
 }
 
@@ -919,6 +1563,9 @@ async function clearStepForPlace(bot: Bot, stepPos: Vec3): Promise<void> {
     return;
   }
   if (distToBlock(bot, stepPos) <= MAX_DIG_REACH) {
+    if (block && refuseProtectedDig(block, "pillar step")) {
+      return;
+    }
     await equipToolCategory(bot, "axe");
     try {
       await digBlockInReach(bot, block, { tool: "axe" });
@@ -984,88 +1631,42 @@ export async function placeLogPillarStep(
   }
 
   if (stepBlock && stepBlock.name !== "air") {
-    if (isOurPlacedStep(stepPos, placedSteps)) {
-      if (isStandingOnBlock(bot, stepPos)) {
-        return true;
+    if (!isOurPlacedStep(stepPos, placedSteps)) {
+      if (isPillarLogStep(stepBlock) && canReachLog(bot, stepPos)) {
+        await equipToolCategory(bot, "axe");
+        await breakLogInPlace(bot, stepPos, logType, undefined, session);
+        stepBlock = bot.blockAt(stepPos);
       }
-      if (!(await equipLogInHand(bot, logType))) {
-        return false;
-      }
-      console.log(`[tree] step up pillar at (${stepPos.x},${stepPos.y},${stepPos.z})`);
-      return mountPillarBlock(bot, stepPos, session);
-    }
-    if (isPillarLogStep(stepBlock) && canReachLog(bot, stepPos)) {
-      await equipToolCategory(bot, "axe");
-      await breakLogInPlace(bot, stepPos, logType, undefined, session);
-      stepBlock = bot.blockAt(stepPos);
-    }
-    if (stepBlock && stepBlock.name !== "air") {
-      await clearStepForPlace(bot, stepPos);
-      stepBlock = bot.blockAt(stepPos);
       if (stepBlock && stepBlock.name !== "air") {
-        return false;
+        await clearStepForPlace(bot, stepPos);
+        stepBlock = bot.blockAt(stepPos);
+        if (stepBlock && stepBlock.name !== "air") {
+          return false;
+        }
+        anchor = trunkPillarAnchor(bot, columnX, columnZ, placedSteps, targetStepY);
+        if (!anchor) {
+          return false;
+        }
+        groundPos = anchor.groundPos;
+        stepPos = anchor.stepPos;
       }
-      anchor = trunkPillarAnchor(bot, columnX, columnZ, placedSteps, targetStepY);
-      if (!anchor) {
-        return false;
-      }
-      groundPos = anchor.groundPos;
-      stepPos = anchor.stepPos;
     }
   }
 
-  if (!(await equipLogInHand(bot, logType))) {
-    console.log("[tree] pillar: no log in hand");
-    return false;
-  }
-
-  const ground = bot.blockAt(groundPos);
-  if (!ground || !isSolidGround(ground)) {
-    return false;
-  }
-
-  console.log(
-    `[tree] equip log → place in trunk column at (${stepPos.x},${stepPos.y},${stepPos.z}) on ${ground.name}`
+  return jumpPlaceLogStep(
+    bot,
+    columnX,
+    columnZ,
+    groundPos,
+    stepPos,
+    logType,
+    placedSteps,
+    session
   );
-
-  const rl = getTreeChopRL();
-  const timings = rl.getTimings();
-
-  await bot.lookAt(ground.position.offset(0.5, 1, 0.5), true);
-  bot.setControlState("jump", true);
-  await delay(timings.placeJumpMs);
-
-  try {
-    await bot.placeBlock(ground, new Vec3(0, 1, 0));
-    bot.setControlState("jump", false);
-    await delay(timings.placeSettleMs);
-  } catch (err) {
-    bot.setControlState("jump", false);
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(`[tree] place log failed: ${msg}`);
-    session?.noteJumpNoPlace(stepPos, "place failed");
-    return false;
-  }
-
-  const placed = bot.blockAt(stepPos);
-  if (!placed || placed.name === "air") {
-    session?.noteJumpNoPlace(stepPos, "no block after place");
-    return false;
-  }
-
-  placedSteps.push(stepPos.clone());
-  session?.notePillarPlace(stepPos);
-  rl.adaptTiming("place", true, timings);
-
-  if (!(await equipLogInHand(bot, logType))) {
-    return false;
-  }
-  console.log(`[tree] jump onto placed log at (${stepPos.x},${stepPos.y},${stepPos.z})`);
-  return mountPillarBlock(bot, stepPos, session);
 }
 
 /**
- * One climb action: place a log on the trunk column when possible.
+ * One climb action: step on dirt beside trunk, place dirt under feet, then logs if needed.
  */
 async function pillarOneStep(
   bot: Bot,
@@ -1073,10 +1674,30 @@ async function pillarOneStep(
   columnZ: number,
   logType: string,
   placedSteps: Vec3[],
-  session?: TreeChopSession
+  session?: TreeChopSession,
+  maxDistance = 48,
+  targetLogY?: number
 ): Promise<boolean> {
   stopPathfinding(bot);
   const feetBefore = feetBlockY(bot);
+
+  if (await tryStepUpNearTrunk(bot, columnX, columnZ, session, targetLogY)) {
+    return feetBlockY(bot) > feetBefore;
+  }
+
+  if (await mountColumnStack(bot, columnX, columnZ, session, targetLogY)) {
+    return feetBlockY(bot) > feetBefore;
+  }
+
+  if (countScaffoldBlocks(bot) < 1) {
+    await ensureScaffoldSupplies(bot, 4, maxDistance, { x: columnX, z: columnZ });
+  }
+
+  if (countScaffoldBlocks(bot) > 0) {
+    if (await placeScaffoldStep(bot, columnX, columnZ, placedSteps, "tree")) {
+      return feetBlockY(bot) > feetBefore;
+    }
+  }
 
   await ensureClimbLogs(bot, logType, new Vec3(columnX, bot.entity.position.y, columnZ));
 
@@ -1084,31 +1705,21 @@ async function pillarOneStep(
     if (await placeLogPillarStep(bot, columnX, columnZ, logType, placedSteps, session)) {
       return feetBlockY(bot) > feetBefore;
     }
-    return false;
   }
 
   const stepPos = new Vec3(columnX, feetBlockY(bot) + 1, columnZ);
   const stepBlock = bot.blockAt(stepPos);
   if (isClimbStepBlock(stepBlock) && !isStandingOnBlock(bot, stepPos)) {
-    console.log(`[tree] mounting step at (${stepPos.x},${stepPos.y},${stepPos.z})`);
     if (await mountPillarBlock(bot, stepPos, session)) {
       return feetBlockY(bot) > feetBefore;
     }
-  }
-
-  if (await mountColumnStack(bot, columnX, columnZ, session)) {
-    return feetBlockY(bot) > feetBefore;
-  }
-
-  if (await tryStepUpNearTrunk(bot, columnX, columnZ, session)) {
-    return feetBlockY(bot) > feetBefore;
   }
 
   return false;
 }
 
 /**
- * Stack logs in the trunk column until the target log is in reach, then equip axe.
+ * Climb the trunk: dirt steps first (like house building), then logs if needed.
  */
 async function climbTowardLog(
   bot: Bot,
@@ -1117,20 +1728,25 @@ async function climbTowardLog(
   tree: DetectedTree,
   placedSteps: Vec3[],
   session: TreeChopSession,
-  _anchorY: number
+  _anchorY: number,
+  maxDistance = 48
 ): Promise<boolean> {
   await standUnderLog(bot, target, session);
 
   let plan = measureClimbGap(bot, tree, target, topLog, placedSteps);
-  console.log(`[tree] climb plan: ${formatClimbGap(plan)}`);
+  const scaffoldHave = countScaffoldBlocks(bot);
+  console.log(
+    `[tree] climb plan: ${formatClimbGap(plan)}` +
+      (scaffoldHave > 0 ? `; ${scaffoldHave} dirt/cobble for steps` : "")
+  );
 
-  if (!plan.enoughLogs) {
+  if (!plan.enoughLogs && scaffoldHave < plan.pillarLogsNeeded) {
     await ensureClimbLogs(bot, tree.logType, target);
     plan = measureClimbGap(bot, tree, target, topLog, placedSteps);
-    console.log(`[tree] after pickup: ${formatClimbGap(plan)}`);
-    if (!plan.enoughLogs) {
+    const scaffoldNow = countScaffoldBlocks(bot);
+    if (!plan.enoughLogs && scaffoldNow === 0 && logCount(bot) === 0) {
       console.log(
-        `[tree] cannot build pillar — need ${plan.pillarLogsNeeded} logs, have ${plan.logsAvailable}`
+        `[tree] cannot climb — need ${plan.pillarLogsNeeded} step(s); have dirt/cobble or logs`
       );
       return false;
     }
@@ -1138,11 +1754,13 @@ async function climbTowardLog(
 
   const column = plan.pillarColumn;
   const startFeet = feetBlockY(bot);
-  const maxSteps = Math.min(tree.maxScanHeight, plan.pillarLogsNeeded + 2);
+  const maxSteps = Math.min(
+    effectiveLogScanTopY(bot, tree) - feetBlockY(bot) + 2,
+    plan.pillarLogsNeeded + 6
+  );
 
   console.log(
-    `[tree] pillar climb in trunk column (${column.x},${column.z}) — ` +
-      `${plan.pillarLogsNeeded} log(s) to reach y=${plan.topLogY}`
+    `[tree] climbing trunk column (${column.x},${column.z}) — dirt steps first, then logs`
   );
 
   await centerOnColumn(bot, column.x, column.z, session);
@@ -1153,25 +1771,16 @@ async function climbTowardLog(
       return true;
     }
 
-    const remaining = plan.pillarLogsNeeded - (feetBlockY(bot) - startFeet);
-    if (remaining <= 0 && !canReachLog(bot, target)) {
-      console.log(`[tree] pillar built but target still out of reach at y=${feetBlockY(bot)}`);
-      return false;
-    }
-
-    if (logCount(bot) === 0) {
-      console.log(`[tree] out of logs with ${remaining} pillar step(s) left`);
-      return false;
-    }
-
     const feetBefore = feetBlockY(bot);
-    const progressed = await placeLogPillarStep(
+    const progressed = await pillarOneStep(
       bot,
       column.x,
       column.z,
       tree.logType,
       placedSteps,
-      session
+      session,
+      maxDistance,
+      target.y
     );
 
     if (canReachLog(bot, target)) {
@@ -1179,11 +1788,8 @@ async function climbTowardLog(
       return true;
     }
 
-    if (!progressed || feetBlockY(bot) <= feetBefore) {
-      console.log(
-        `[tree] pillar step failed at y=${feetBlockY(bot)} ` +
-          `(${Math.max(0, remaining)} left of ${plan.pillarLogsNeeded})`
-      );
+    if (!progressed && feetBlockY(bot) <= feetBefore) {
+      console.log(`[tree] climb stalled at y=${feetBlockY(bot)}`);
       return false;
     }
   }
@@ -1221,12 +1827,16 @@ async function breakLogInPlace(
   if (!isLogBlock(block)) {
     return false;
   }
+  if (refuseProtectedDig(block, "log chop")) {
+    return false;
+  }
   try {
+    stopPathfinding(bot);
+    await equipToolCategory(bot, "axe");
     await digBlockInReach(bot, block, { tool: "axe" });
     console.log(`[tree] broke ${block.name} at (${pos.x},${pos.y},${pos.z})`);
     session?.noteBreak(bot, pos);
-    const elevated = anchorY != null && isElevatedOnTree(bot, anchorY);
-    await pickupLogsNear(bot, pos, logType ?? block.name, !elevated, session);
+    await pickupLogsNear(bot, pos, logType ?? block.name, false, session);
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1261,7 +1871,6 @@ export async function chopTreeAndStash(
   const placedSteps: Vec3[] = [];
   let logsCut = 0;
   let stashed = 0;
-  let idlePasses = 0;
 
   console.log(`[tree] ${tree.description}`);
   console.log(
@@ -1272,10 +1881,7 @@ export async function chopTreeAndStash(
   const rl = getTreeChopRL();
   const session = rl.startSession();
 
-  let pillarAttempts = 0;
   let climbStuckPasses = 0;
-
-  await clearTrunkLeaves(bot, tree, 24);
 
   let liveAtStart = scanChoppableLogs(bot, tree, placedSteps);
   if (liveAtStart.length === 0) {
@@ -1292,9 +1898,12 @@ export async function chopTreeAndStash(
 
   const firstLog = liveAtStart[0]!;
   const startPillar = pickTrunkPillarColumn(tree, firstLog, bot);
-  let column = new Vec3(startPillar.x, anchor.y, startPillar.z);
+  const columnX = startPillar.x;
+  const columnZ = startPillar.z;
+  const column = new Vec3(columnX, anchor.y, columnZ);
+  const columnLock = { x: columnX, z: columnZ };
 
-  if (!(await approachTrunk(bot, column, anchor.y))) {
+  if (!(await approachTrunk(bot, column, anchor.y, tree))) {
     rl.finishSession(session);
     return {
       ok: false,
@@ -1305,9 +1914,13 @@ export async function chopTreeAndStash(
     };
   }
 
+  await clearTrunkLeaves(bot, tree, 32, columnLock);
+
   const topY = liveAtStart[liveAtStart.length - 1]!.y;
   const gap = measureClimbGap(bot, tree, firstLog, liveAtStart[liveAtStart.length - 1]!, placedSteps);
-  console.log(`[tree] ${liveAtStart.length} trunk log(s) y=${firstLog.y}–${topY}; ${formatClimbGap(gap)}`);
+  console.log(
+    `[tree] locked trunk column (${columnX},${columnZ}) — ${liveAtStart.length} log(s) y=${firstLog.y}–${topY}; ${formatClimbGap(gap)}`
+  );
 
   while (Date.now() < deadline) {
     if (isSleepRoutineActive()) {
@@ -1316,149 +1929,94 @@ export async function chopTreeAndStash(
 
     stopPathfinding(bot);
     await equipToolCategory(bot, "axe");
+    await centerOnColumn(bot, columnX, columnZ, session);
 
-    await clearTrunkLeaves(bot, tree, 8);
-
-    const elevated = isElevatedOnTree(bot, anchor.y);
-    if (!elevated && !isOnColumn(bot, column.x, column.z)) {
-      await approachTrunk(bot, column, anchor.y);
-    }
-
-    const liveLogs = scanChoppableLogs(bot, tree, placedSteps);
-    const focusLog =
-      liveLogs.find((p) => !canReachLog(bot, p)) ?? liveLogs[liveLogs.length - 1];
-    if (focusLog) {
-      const p = pickTrunkPillarColumn(tree, focusLog, bot);
-      column = new Vec3(p.x, anchor.y, p.z);
-    }
-
+    let liveLogs = scanChoppableLogs(bot, tree, placedSteps);
     if (liveLogs.length === 0) {
-      const trunkLeavesLeft = scanTrunkLeaves(bot, tree).length;
-      if (trunkLeavesLeft > 0) {
-        await clearTrunkLeaves(bot, tree, 16);
+      await clearTrunkLeaves(bot, tree, 20, columnLock);
+      liveLogs = scanChoppableLogs(bot, tree, placedSteps);
+      if (liveLogs.length === 0) {
+        console.log("[tree] no trunk logs left in tree scan");
+        break;
       }
-      const leavesLeft = countLeavesNear(bot, tree);
-      console.log(
-        `[tree] no logs left — ${trunkLeavesLeft > 0 ? "cleared trunk leaves" : `${leavesLeft} canopy leaves remain`}`
-      );
-      break;
     }
+
+    await clearTrunkLeaves(bot, tree, 16, columnLock);
 
     const reachable = liveLogs.filter((p) => canReachLog(bot, p)).sort((a, b) => a.y - b.y);
-
     if (reachable.length > 0) {
-      idlePasses = 0;
-      pillarAttempts = 0;
       climbStuckPasses = 0;
       for (const pos of reachable) {
         if (await breakLogInPlace(bot, pos, tree.logType, anchor.y, session)) {
           logsCut += 1;
+          stashed += await maybeStashLogs(bot, maxDistance);
         }
       }
       continue;
     }
 
-    await clearTrunkLeaves(bot, tree, 6);
-    await lookStraightUp(bot, tree, session);
-
-    const remaining = liveLogs
-      .filter((p) => !canReachLog(bot, p))
-      .sort((a, b) => a.y - b.y);
-
-    if (remaining.length === 0) {
-      idlePasses += 1;
-      if (idlePasses >= 2) {
-        break;
-      }
-      continue;
-    }
-
-    const next = remaining[0]!;
-    idlePasses = 0;
-
-    if (canReachLog(bot, next)) {
-      if (await breakLogInPlace(bot, next, tree.logType, anchor.y, session)) {
-        logsCut += 1;
-        pillarAttempts = 0;
-      }
-      continue;
-    }
-
-    if (horizontalDistToColumn(bot, next.x, next.z) > 1.2) {
-      console.log(`[tree] moving under log at (${next.x},${next.y},${next.z})`);
-      await standUnderLog(bot, next, session);
+    const nextLogY = liveLogs[0]!.y;
+    if (await tryClimbSurfaceNearTrunk(bot, columnX, columnZ, session, nextLogY)) {
       climbStuckPasses = 0;
-      if (canReachLog(bot, next)) {
+      continue;
+    }
+
+    const leavesCleared = await clearTrunkLeaves(bot, tree, 24, columnLock);
+    if (leavesCleared > 0) {
+      const afterLeaves = liveLogs.filter((p) => canReachLog(bot, p)).sort((a, b) => a.y - b.y);
+      if (afterLeaves.length > 0) {
+        climbStuckPasses = 0;
+        for (const pos of afterLeaves) {
+          if (await breakLogInPlace(bot, pos, tree.logType, anchor.y, session)) {
+            logsCut += 1;
+            stashed += await maybeStashLogs(bot, maxDistance);
+          }
+        }
         continue;
       }
     }
 
-    const maxClimbPasses = logCount(bot) >= 3 ? 10 : 3;
-    if (pillarAttempts >= maxClimbPasses || climbStuckPasses >= maxClimbPasses) {
-      rl.finishSession(session);
-      return {
-        ok: logsCut > 0,
-        reason:
-          logsCut > 0
-            ? `${tree.profile.label}: cut ${logsCut} logs but could not climb higher — need more logs for pillar or stand closer`
-            : `Could not reach the ${tree.profile.label.toLowerCase()} trunk — move me closer to the tree base`,
-        logsCut,
-        rlPoints: session.points,
-        treeType: tree.profile.label,
-        treeDescription: tree.description
-      };
-    }
+    await lookStraightUp(bot, tree, session);
+    const feetBefore = feetBlockY(bot);
+    const stepped = await pillarOneStep(
+      bot,
+      columnX,
+      columnZ,
+      tree.logType,
+      placedSteps,
+      session,
+      maxDistance,
+      nextLogY
+    );
 
-    const topLog = remaining[remaining.length - 1] ?? next;
-    const climbPlan = measureClimbGap(bot, tree, next, topLog, placedSteps);
-    console.log(`[tree] log at (${next.x},${next.y},${next.z}) out of reach`);
-    console.log(`[tree] ${formatClimbGap(climbPlan)}`);
-
-    const climbed = await climbTowardLog(bot, next, topLog, tree, placedSteps, session, anchor.y);
-    pillarAttempts += 1;
-
-    if (!climbed && !canReachLog(bot, next)) {
-      climbStuckPasses += 1;
-      console.log(`[tree] climb stuck (${climbStuckPasses}/3) — feet at y=${feetBlockY(bot)}`);
-      if (logCount(bot) === 0) {
-      rl.finishSession(session);
-      return {
-        ok: logsCut > 0,
-        reason:
-          logsCut > 0
-            ? `${tree.profile.label}: cut ${logsCut} logs — pick up more logs for pillar (say check logs)`
-            : `Need logs in inventory to build pillar — pick up drops or say check logs`,
-        logsCut,
-        rlPoints: session.points,
-        treeType: tree.profile.label,
-        treeDescription: tree.description
-      };
-      }
-      await delay(300);
+    if (stepped && feetBlockY(bot) > feetBefore) {
+      climbStuckPasses = 0;
       continue;
     }
-    climbStuckPasses = 0;
 
-    await equipToolCategory(bot, "axe");
-    await lookStraightUp(bot, tree, session);
-
-    const stillReachable = scanChoppableLogs(bot, tree, placedSteps)
-      .filter((p) => canReachLog(bot, p))
-      .sort((a, b) => a.y - b.y);
-    for (const pos of stillReachable) {
-      if (await breakLogInPlace(bot, pos, tree.logType, anchor.y, session)) {
-        logsCut += 1;
-        pillarAttempts = 0;
-      }
+    climbStuckPasses += 1;
+    console.log(
+      `[tree] cannot reach higher logs — feet y=${feetBlockY(bot)} ` +
+        `(dirt/cobble=${countScaffoldBlocks(bot)}, logs=${logCount(bot)})`
+    );
+    if (climbStuckPasses >= 4) {
+      break;
     }
+    await delay(200);
   }
 
   placedSteps.sort((a, b) => b.y - a.y);
   for (const pos of placedSteps) {
     const block = bot.blockAt(pos);
-    if (isLogBlock(block)) {
+    if (!block || block.name === "air") {
+      continue;
+    }
+    const blockName = block.name;
+    if (isLogBlock(block) || isScaffoldBlockName(blockName)) {
       await breakLogInPlace(bot, pos, tree.logType, anchor.y, session);
-      logsCut += 1;
+      if (isLogBlockName(blockName)) {
+        logsCut += 1;
+      }
     }
     stashed += await maybeStashLogs(bot, maxDistance);
   }
@@ -1484,8 +2042,21 @@ export async function chopTreeAndStash(
   const leavesLeft = countLeavesNear(bot, tree);
   const done = left === 0;
   const pts = session.points > 0 ? `; +${session.points} RL pts` : "";
+
+  let planted = 0;
+  let plantMsg = "";
+  if (done) {
+    const plantResult = await replantTreeFromChest(bot, tree, maxDistance, deadline);
+    planted = plantResult.planted ?? 0;
+    plantMsg = plantResult.ok
+      ? ` ${plantResult.reason}`
+      : plantResult.reason
+        ? ` ${plantResult.reason}`
+        : "";
+  }
+
   const msg = done
-    ? `${tree.profile.label} tree done (${logsCut} logs, leaves decaying); stashed ${stashed}${pts}`
+    ? `${tree.profile.label} tree done (${logsCut} logs, leaves decaying); stashed ${stashed}${planted > 0 ? `, planted ${planted} sapling(s)` : ""}${pts}${planted === 0 ? plantMsg : ""}`
     : `${tree.profile.label}: cut ${logsCut} logs (${left} trunk left, ${leavesLeft} leaf blocks); stashed ${stashed}${pts}`;
 
   console.log(`[tree] ${msg}`);
@@ -1493,6 +2064,7 @@ export async function chopTreeAndStash(
     ok: done || logsCut > 0,
     logsCut,
     stashed,
+    planted,
     reason: msg,
     treeType: tree.profile.label,
     treeDescription: tree.description,

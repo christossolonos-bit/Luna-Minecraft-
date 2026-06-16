@@ -7,6 +7,18 @@ import { checkOllamaHealth } from "../mc-ai/ollama";
 import { McVoice, voiceEnabledFromEnv } from "../mc-ai/voice";
 import { ActionRunner, createQueuedSender, UserCommandJob, UserCommandQueue } from "../mc-ai/sequential";
 import { abilitiesHelpText } from "./abilities";
+import {
+  clearPendingResume,
+  getPendingResume,
+  hasPendingResume,
+  inventoryGained,
+  inventoryTotals,
+  markTaskIncomplete,
+  resumeSay,
+  ResumableTask,
+  suppliesForPendingTask
+} from "../task-resume";
+import { ActionResult } from "../types";
 
 export type SimpleLunaOptions = {
   /** Ollama + optional TTS for conversation — written commands unchanged. */
@@ -21,8 +33,12 @@ type SimpleCommand =
   | "check_logs"
   | "collect_wheat"
   | "plant_wheat"
+  | "build_house"
+  | "continue"
   | "take_pickaxe"
   | "take_axe"
+  | "strip_mine"
+  | "mine_ores"
   | "help"
   | "unknown";
 
@@ -51,17 +67,21 @@ function missingToolsMessage(state: CompanionState | null): string | null {
 function parseCommand(
   message: string,
   state: CompanionState | null
-): { cmd: SimpleCommand; say: string; skipAction?: boolean } {
+): { cmd: SimpleCommand; say: string; skipAction?: boolean; taskTarget?: string } {
   const m = message.trim().toLowerCase();
   if (!m || /^(help|abilities|what can you do)\b/.test(m)) {
     return {
       cmd: "help",
       say:
-        'Commands: follow me, stop, tp to me, gather wood, collect wheat, plant wheat, check logs, put in chest, take pickaxe, take axe.'
+        'Commands: follow, stop, tp, gather wood, strip mine, mine ores, build house, wheat, chest, take pickaxe/axe.'
     };
   }
   if (/\b(stop|stay there|wait here|don't follow|dont follow|halt)\b/.test(m)) {
-    return { cmd: "stop", say: "Okay, I'll stay here." };
+    const mining = /\b(stop|halt)\s+(strip\s+)?min(?:e|ing)\b/.test(m);
+    return {
+      cmd: "stop",
+      say: mining ? "Stopping strip mining." : "Okay, I'll stay here."
+    };
   }
   if (/\b(follow me|stay with me|stick with me|follow)\b/.test(m)) {
     return { cmd: "follow", say: "Following you!" };
@@ -78,6 +98,36 @@ function parseCommand(
   if (/\b(take|grab|get)\s+(a\s+)?axe\b/.test(m)) {
     return { cmd: "take_axe", say: "Getting an axe from the chest." };
   }
+  if (/\b(mine|get|dig|harvest)\s+(the\s+)?ores?\b/.test(m)) {
+    return { cmd: "mine_ores", say: "Mining the ores I found — then continuing the tunnel." };
+  }
+  if (
+    /\b(mine forward|keep strip min(?:e|ing)|continue strip min(?:e|ing))\b/.test(m)
+  ) {
+    return {
+      cmd: "strip_mine",
+      say: "Continuing the strip mine at the same depth.",
+      taskTarget: "resume"
+    };
+  }
+  if (
+    /\bstrip\s*mine\b/.test(m) ||
+    /\b(start|begin)\s+strip\s*min(?:e|ing)\b/.test(m) ||
+    /\bmine\s+(at\s+)?(this\s+)?(level|depth|y)\b/.test(m) ||
+    /\bmine\s+here\b/.test(m)
+  ) {
+    if (!hasToolInState(state, "pickaxe")) {
+      return {
+        cmd: "strip_mine",
+        say: "I need a pickaxe for strip mining — say take pickaxe.",
+        skipAction: true
+      };
+    }
+    return {
+      cmd: "strip_mine",
+      say: "Strip mining at this depth — I'll keep going until I find ores or you say stop."
+    };
+  }
   const wantsGatherWood =
     /\b(gather wood|chop wood|cut (a |the |)tree|get wood)\b/.test(m) ||
     /\b(chop|cut|fell)(?:ping|s|t|ting)?\s+(?:down\s+)?(?:the\s+|this\s+|a\s+)?tree\b/.test(m) ||
@@ -90,7 +140,25 @@ function parseCommand(
         skipAction: true
       };
     }
-    return { cmd: "gather_wood", say: "Finding a tree and checking what kind it is…" };
+    return { cmd: "gather_wood", say: "Finding a tree — I'll stash logs and replant saplings from the chest." };
+  }
+  if (
+    /\b(continue|keep going|resume)\b/.test(m) ||
+    /\bfinish\s+(the\s+|my\s+|)(house|build)\b/.test(m)
+  ) {
+    if (!hasPendingResume()) {
+      return { cmd: "continue", say: "I don't have a paused task right now.", skipAction: true };
+    }
+    return { cmd: "continue", say: resumeSay(getPendingResume()!.task) };
+  }
+  if (
+    /\b(build|make|construct)\s+(a\s+|my\s+|the\s+|)(house|home|shelter)\b/.test(m) ||
+    /\b(build house|make house|build home)\b/.test(m)
+  ) {
+    return {
+      cmd: "build_house",
+      say: "Looking for your sign — I'll build a starter cottage with porch, windows, and a peaked roof."
+    };
   }
   if (
     /\b(plant|replant|sow)\s+(the\s+|my\s+|)(wheat|farm|seeds?)\b/.test(m) ||
@@ -123,7 +191,7 @@ function parseCommand(
   }
   return {
     cmd: "unknown",
-    say: 'Try "follow me", "gather wood", "collect wheat", "plant wheat", or "take axe".'
+    say: 'Try "follow me", "gather wood", "build house", "collect wheat", or "take axe".'
   };
 }
 
@@ -154,6 +222,9 @@ export async function startSimpleLuna(options: SimpleLunaOptions = {}): Promise<
   let lastFollowMoveAt = 0;
   let lastChatReplyAt = 0;
   let busy = false;
+  let stripMineLoopActive = false;
+  let prevInventory = new Map<string, number>();
+  let resumeCooldownUntil = 0;
 
   const brain = enableLlmChat ? new McBrain(config) : null;
   const voiceFlags = voiceEnabledFromEnv();
@@ -188,6 +259,93 @@ export async function startSimpleLuna(options: SimpleLunaOptions = {}): Promise<
   voice?.start();
   console.log("");
 
+  function noteTaskOutcome(task: ResumableTask, result: ActionResult): void {
+    if (result.detail === "incomplete" || result.detail === "need_sign") {
+      markTaskIncomplete(task, result.reason ?? "needs more supplies");
+      return;
+    }
+    if (result.ok) {
+      clearPendingResume();
+    }
+  }
+
+  async function resumePendingTask(task: ResumableTask): Promise<void> {
+    followOwner = false;
+    await runAction({ type: "stop_all" });
+    const result = await runAction({ type: "run_task", task });
+    noteTaskOutcome(task, result);
+    if (result.reason) {
+      await runAction({
+        type: "chat",
+        message: (result.ok ? result.reason : `Task failed: ${result.reason}`).slice(
+          0,
+          config.mcChatLimit
+        )
+      });
+    }
+  }
+
+  async function runStripMineBackground(taskTarget?: string): Promise<void> {
+    if (stripMineLoopActive) {
+      await announce("Already strip mining — say stop to halt.");
+      return;
+    }
+    stripMineLoopActive = true;
+    busy = true;
+    try {
+      let resume = taskTarget === "resume";
+      while (stripMineLoopActive) {
+        const result = await runAction({
+          type: "run_task",
+          task: "strip_mine",
+          target: resume ? "resume" : undefined
+        });
+        resume = true;
+
+        if (result.reason) {
+          await runAction({
+            type: "chat",
+            message: (result.ok ? result.reason : `Strip mine: ${result.reason}`).slice(
+              0,
+              config.mcChatLimit
+            )
+          });
+        }
+
+        if (result.detail === "ores_found" || result.detail === "stopped" || !result.ok) {
+          break;
+        }
+        break;
+      }
+    } finally {
+      stripMineLoopActive = false;
+      busy = false;
+    }
+  }
+
+  async function runMineOresAndResume(): Promise<void> {
+    busy = true;
+    try {
+      const result = await runAction({ type: "run_task", task: "mine_ores" });
+      if (result.reason) {
+        await runAction({
+          type: "chat",
+          message: (result.ok ? result.reason : `Mine ores: ${result.reason}`).slice(
+            0,
+            config.mcChatLimit
+          )
+        });
+      }
+      if (result.ok) {
+        await runStripMineBackground("resume");
+      }
+    } finally {
+      if (!stripMineLoopActive) {
+        busy = false;
+      }
+    }
+  }
+
   async function runTakeTool(kind: "pickaxe" | "axe"): Promise<void> {
     followOwner = false;
     await runAction({ type: "stop_all" });
@@ -207,13 +365,14 @@ export async function startSimpleLuna(options: SimpleLunaOptions = {}): Promise<
     }
   }
 
-  async function runCommand(cmd: SimpleCommand): Promise<void> {
+  async function runCommand(cmd: SimpleCommand, taskTarget?: string): Promise<void> {
     switch (cmd) {
       case "follow":
         followOwner = true;
         break;
       case "stop":
         followOwner = false;
+        stripMineLoopActive = false;
         await runAction({ type: "stop_all" });
         break;
       case "tp":
@@ -259,6 +418,15 @@ export async function startSimpleLuna(options: SimpleLunaOptions = {}): Promise<
       case "take_axe":
         await runTakeTool("axe");
         break;
+      case "strip_mine":
+        followOwner = false;
+        await runAction({ type: "stop_all" });
+        void runStripMineBackground(taskTarget);
+        break;
+      case "mine_ores":
+        followOwner = false;
+        void runMineOresAndResume();
+        break;
       case "collect_wheat":
         followOwner = false;
         await runAction({ type: "stop_all" });
@@ -289,6 +457,28 @@ export async function startSimpleLuna(options: SimpleLunaOptions = {}): Promise<
               )
             });
           }
+        }
+        break;
+      case "build_house":
+        followOwner = false;
+        await runAction({ type: "stop_all" });
+        {
+          const result = await runAction({ type: "run_task", task: "build_house" });
+          noteTaskOutcome("build_house", result);
+          if (result.reason) {
+            await runAction({
+              type: "chat",
+              message: (result.ok ? result.reason : `Build failed: ${result.reason}`).slice(
+                0,
+                config.mcChatLimit
+              )
+            });
+          }
+        }
+        break;
+      case "continue":
+        if (hasPendingResume()) {
+          await resumePendingTask(getPendingResume()!.task);
         }
         break;
       case "check_logs":
@@ -372,14 +562,14 @@ export async function startSimpleLuna(options: SimpleLunaOptions = {}): Promise<
   async function processOwnerCommand(job: UserCommandJob): Promise<void> {
     busy = true;
     try {
-      const { cmd, say, skipAction } = parseCommand(job.message, latestState);
+      const { cmd, say, skipAction, taskTarget } = parseCommand(job.message, latestState);
 
       if (isWrittenCommand(cmd)) {
         if (say) {
           await announce(say);
         }
         if (!skipAction) {
-          await runCommand(cmd);
+          await runCommand(cmd, taskTarget);
         }
         return;
       }
@@ -402,6 +592,31 @@ export async function startSimpleLuna(options: SimpleLunaOptions = {}): Promise<
 
   client.onState((state) => {
     latestState = state;
+
+    const invNow = inventoryTotals(state.inventory);
+    if (prevInventory.size > 0) {
+      const gained = inventoryGained(prevInventory, invNow);
+      const pending = getPendingResume();
+      if (
+        pending &&
+        !busy &&
+        commandQueue.pending === 0 &&
+        Date.now() >= resumeCooldownUntil &&
+        suppliesForPendingTask(gained, pending.task)
+      ) {
+        resumeCooldownUntil = Date.now() + 4000;
+        void (async () => {
+          busy = true;
+          try {
+            await announce(resumeSay(pending.task));
+            await resumePendingTask(pending.task);
+          } finally {
+            busy = false;
+          }
+        })();
+      }
+    }
+    prevInventory = invNow;
 
     if (state.ownerSleeping || state.lunaSleeping) {
       followOwner = false;

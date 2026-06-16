@@ -31,6 +31,7 @@ export type TaskIntent =
   | "deposit_chest"
   | "collect_wheat"
   | "plant_wheat"
+  | "build_house"
   | "fight_mobs"
   | "hunt_animal";
 
@@ -158,6 +159,7 @@ function normalizeTask(value: unknown): TaskIntent | null {
   if (v === "deposit_chest" || v === "deposit") return "deposit_chest";
   if (v === "collect_wheat" || v === "wheat" || v === "harvest_wheat") return "collect_wheat";
   if (v === "plant_wheat" || v === "replant" || v === "plant_farm") return "plant_wheat";
+  if (v === "build_house" || v === "house" || v === "build_home") return "build_house";
   if (v === "fight_mobs" || v === "fight" || v === "combat") return "fight_mobs";
   if (v === "hunt_animal" || v === "hunt" || v === "hunt_mob") return "hunt_animal";
   if (v === "none" || v === "") return "none";
@@ -342,6 +344,12 @@ export function heuristicTask(message: string): TaskIntent {
   }
   if (/\b(plant|replant|sow|seed)\s+(the\s+|my\s+|)(wheat|farm|seeds?)\b/.test(m)) {
     return "plant_wheat";
+  }
+  if (/\b(build|make|construct)\s+(a\s+|my\s+|the\s+|)(house|home|shelter)\b/.test(m)) {
+    return "build_house";
+  }
+  if (/\b(build house|make house|build home)\b/.test(m)) {
+    return "build_house";
   }
   if (
     /\b(craft torches?|make torches?|craft armor|make armor|craft bread|survival gear|craft gear|make shield|craft furnace)\b/.test(

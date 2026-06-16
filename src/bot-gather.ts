@@ -3,7 +3,8 @@ import { Block } from "prismarine-block";
 import { goals, Movements } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { equipToolCategory } from "./bot-inventory";
-import { isBedBlock, isBedBlockName, isSleepRoutineActive } from "./bot-sleep";
+import { isBedBlock, isSleepRoutineActive } from "./bot-sleep";
+import { addProtectedBlocksToMovements, refuseProtectedDig } from "./bot-protect";
 
 const MAX_DIG_REACH = 4.5;
 
@@ -29,17 +30,13 @@ export function abortActiveMining(bot: Bot): void {
   }
 }
 
-function configureGatherMovements(bot: Bot): Movements {
+export function configureGatherMovements(bot: Bot): Movements {
   const movements = new Movements(bot);
   movements.canDig = true;
   movements.allowSprinting = true;
   movements.dontMineUnderFallingBlock = false;
   movements.dontCreateFlow = false;
-  for (const name of Object.keys(bot.registry.blocksByName)) {
-    if (isBedBlockName(name)) {
-      movements.blocksCantBreak.add(bot.registry.blocksByName[name].id);
-    }
-  }
+  addProtectedBlocksToMovements(bot, movements);
   bot.pathfinder.setMovements(movements);
   return movements;
 }
@@ -87,11 +84,71 @@ function blockCenter(block: Block): Vec3 {
   return block.position.offset(0.5, 0.5, 0.5);
 }
 
-/** Dig a block already in reach — no pathfinding (for tree trunk mining). */
-export async function digBlockInReach(
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function blockIsGone(bot: Bot, pos: Vec3): boolean {
+  const b = bot.blockAt(pos);
+  return !b || b.name === "air";
+}
+
+/** Resolve when the block at `pos` becomes air (backup if dig promise ends early). */
+function waitForBlockBroken(bot: Bot, pos: Vec3, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (blockIsGone(bot, pos)) {
+      resolve();
+      return;
+    }
+
+    const onUpdate = (oldBlock: Block | null, newBlock: Block | null) => {
+      if (newBlock?.position.equals(pos) && (!newBlock || newBlock.name === "air")) {
+        cleanup();
+        resolve();
+      }
+      if (oldBlock?.position.equals(pos) && blockIsGone(bot, pos)) {
+        cleanup();
+        resolve();
+      }
+    };
+
+    const timer = setTimeout(() => {
+      cleanup();
+      if (blockIsGone(bot, pos)) {
+        resolve();
+      } else {
+        reject(new Error("mining timed out"));
+      }
+    }, timeoutMs);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      bot.removeListener("blockUpdate", onUpdate);
+    };
+
+    bot.on("blockUpdate", onUpdate);
+  });
+}
+
+function stopOtherDig(bot: Bot, pos: Vec3): void {
+  const target = bot.targetDigBlock;
+  if (target && !target.position.equals(pos)) {
+    try {
+      bot.stopDigging();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
+ * Hold dig on a block until it breaks — retries if a swing is interrupted.
+ * Uses force-look + raycast face so the axe stays on target.
+ */
+export async function holdDigUntilBroken(
   bot: Bot,
   block: Block,
-  options: { tool?: "pickaxe" | "axe" } = {}
+  options: { tool?: "pickaxe" | "axe"; maxRetries?: number } = {}
 ): Promise<void> {
   if (!bot.entity) {
     throw new Error("Bot not spawned");
@@ -102,44 +159,101 @@ export async function digBlockInReach(
   if (isBedBlock(block)) {
     throw new Error("will not break a bed");
   }
-
-  const current = bot.blockAt(block.position);
-  if (!current || current.name === "air") {
-    throw new Error("Block already gone");
+  if (refuseProtectedDig(block, "protected workstation")) {
+    throw new Error(`will not break ${block.name}`);
   }
 
+  const pos = block.position.clone();
   const prefer = options.tool ?? "pickaxe";
-  await equipForMining(bot, current, prefer);
+  const maxRetries = options.maxRetries ?? 6;
+  const digTimeout = Number(process.env.MC_DIG_TIMEOUT_MS ?? "45000") || 45_000;
 
-  const held = bot.heldItem;
-  if (!held) {
-    throw new Error(`No tool equipped to mine ${current.name}`);
-  }
-  if (!current.canHarvest(held.type)) {
-    throw new Error(`Cannot harvest ${current.name} with ${held.name}`);
+  if (blockIsGone(bot, pos)) {
+    return;
   }
 
-  const dist = bot.entity.position.distanceTo(blockCenter(current));
-  if (dist > MAX_DIG_REACH) {
-    throw new Error(`Too far to mine ${current.name} (${dist.toFixed(1)}m)`);
-  }
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    if (isSleepRoutineActive()) {
+      throw new Error("paused — owner is sleeping");
+    }
 
-  await bot.lookAt(blockCenter(current), true);
+    const current = bot.blockAt(pos);
+    if (!current || current.name === "air") {
+      return;
+    }
 
-  const digTimeout = Number(process.env.MC_DIG_TIMEOUT_MS ?? "30000") || 30_000;
-  await Promise.race([
-    bot.dig(current),
-    new Promise<never>((_, reject) => {
-      setTimeout(() => {
+    stopOtherDig(bot, pos);
+    await equipForMining(bot, current, prefer);
+
+    const held = bot.heldItem;
+    if (!held) {
+      throw new Error(`No tool equipped to mine ${current.name}`);
+    }
+    if (!current.canHarvest(held.type)) {
+      throw new Error(`Cannot harvest ${current.name} with ${held.name}`);
+    }
+    if (!bot.canDigBlock(current)) {
+      throw new Error(`Cannot reach ${current.name} to mine`);
+    }
+
+    const dist = bot.entity.position.distanceTo(blockCenter(current));
+    if (dist > MAX_DIG_REACH) {
+      throw new Error(`Too far to mine ${current.name} (${dist.toFixed(1)}m)`);
+    }
+
+    await bot.lookAt(blockCenter(current), true);
+    bot.clearControlStates();
+
+    try {
+      await Promise.race([
+        bot.dig(current, true, "raycast"),
+        waitForBlockBroken(bot, pos, digTimeout)
+      ]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!blockIsGone(bot, pos)) {
+        console.log(`[gather] mining attempt ${attempt + 1}/${maxRetries} interrupted: ${msg}`);
         try {
           bot.stopDigging();
         } catch {
           // ignore
         }
-        reject(new Error(`dig ${current.name} timed out`));
-      }, digTimeout);
-    })
-  ]);
+        await delay(120 + attempt * 40);
+        continue;
+      }
+    }
+
+    if (blockIsGone(bot, pos)) {
+      try {
+        bot.stopDigging();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    console.log(`[gather] mining attempt ${attempt + 1}/${maxRetries} — ${current.name} still there`);
+    try {
+      bot.stopDigging();
+    } catch {
+      // ignore
+    }
+    await delay(100 + attempt * 30);
+  }
+
+  const left = bot.blockAt(pos);
+  if (left && left.name !== "air") {
+    throw new Error(`Mining failed — ${left.name} still at (${pos.x},${pos.y},${pos.z})`);
+  }
+}
+
+/** Dig a block already in reach — no pathfinding (for tree trunk mining). */
+export async function digBlockInReach(
+  bot: Bot,
+  block: Block,
+  options: { tool?: "pickaxe" | "axe" } = {}
+): Promise<void> {
+  await holdDigUntilBroken(bot, block, options);
 }
 
 /**
@@ -160,6 +274,9 @@ export async function mineBlockReliably(
   if (isBedBlock(block)) {
     throw new Error("will not break a bed");
   }
+  if (refuseProtectedDig(block, "protected workstation")) {
+    throw new Error(`will not break ${block.name}`);
+  }
 
   configureGatherMovements(bot);
   const pathTimeout = options.pathTimeoutMs ?? 25_000;
@@ -174,47 +291,8 @@ export async function mineBlockReliably(
     }
   }
 
-  const current = bot.blockAt(block.position);
-  if (!current || current.name === "air") {
-    throw new Error("Block already gone");
-  }
-
-  await equipForMining(bot, current, prefer);
-
-  const held = bot.heldItem;
-  if (!held) {
-    throw new Error(`No tool equipped to mine ${current.name}`);
-  }
-  if (!current.canHarvest(held.type)) {
-    throw new Error(`Cannot harvest ${current.name} with ${held.name} — need a better pickaxe`);
-  }
-
-  const dist = bot.entity.position.distanceTo(blockCenter(current));
-  if (dist > MAX_DIG_REACH) {
-    throw new Error(`Too far to mine ${current.name} (${dist.toFixed(1)}m, need ≤${MAX_DIG_REACH}m)`);
-  }
-
-  await bot.lookAt(blockCenter(current), true);
-
-  const digTimeout = Number(process.env.MC_DIG_TIMEOUT_MS ?? "30000") || 30_000;
-  await Promise.race([
-    bot.dig(current),
-    new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        try {
-          bot.stopDigging();
-        } catch {
-          // ignore
-        }
-        reject(new Error(`dig ${current.name} timed out`));
-      }, digTimeout);
-    })
-  ]);
-
-  const after = bot.blockAt(block.position);
-  if (after && after.name !== "air" && after.name === current.name) {
-    throw new Error(`Dig finished but ${current.name} still there`);
-  }
+  bot.pathfinder.setGoal(null);
+  await digBlockInReach(bot, block, { tool: prefer });
 }
 
 export function pickaxeOrAxeForBlock(name: string): "pickaxe" | "axe" {

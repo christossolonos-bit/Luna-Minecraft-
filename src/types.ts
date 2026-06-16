@@ -144,6 +144,9 @@ export type CompanionAction =
         | "check_logs"
         | "collect_wheat"
         | "plant_wheat"
+        | "build_house"
+        | "strip_mine"
+        | "mine_ores"
         | "fight_mobs"
         | "hunt_animal";
       amount?: number;

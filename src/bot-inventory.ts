@@ -80,6 +80,7 @@ export function hasToolCategory(bot: Bot, category: ToolCategory): boolean {
 
 export const PICKAXE_ITEM_NAMES = PICK_NAMES;
 export const AXE_ITEM_NAMES = AXE_NAMES;
+export const SHOVEL_ITEM_NAMES = SHOVEL_NAMES;
 
 export function findBestTool(bot: Bot, category: ToolCategory) {
   const list =
@@ -124,7 +125,7 @@ export async function prepareToolsForTask(bot: Bot, task: string): Promise<void>
       return;
     }
   }
-  if (task === "gather_stone" || task === "gather_coal") {
+  if (task === "gather_stone" || task === "gather_coal" || task === "strip_mine" || task === "mine_ores") {
     if (await equipToolCategory(bot, "pickaxe")) {
       return;
     }

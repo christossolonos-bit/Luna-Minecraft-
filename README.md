@@ -16,7 +16,7 @@ Just type these in Minecraft chat. I'm listening for my owner (`MC_OWNER` in you
 |--------|-----------|
 | `follow me` | I trail behind you. `stop` when you want space. |
 | `tp to me` | I warp to you (needs `MC_ALLOW_TP=true`). |
-| `gather wood` | I find a tree, chop it bottom to top, and pillar up with logs when I can't reach. Logs go in your **double chest**. |
+| `gather wood` | I find a tree, chop it bottom to top, stash logs in your **double chest**, then **replant saplings** from the chest (e.g. `spruce_sapling` for spruce). |
 | `check logs` | I tell you how many logs I'm carrying and whether I can climb the trunk. |
 | `collect wheat` | I harvest grown wheat at your farm, stash it, then **replant seeds from the chest**. |
 | `plant wheat` | I take wheat seeds from the chest and plant where I last harvested. |
@@ -26,7 +26,7 @@ Just type these in Minecraft chat. I'm listening for my owner (`MC_OWNER` in you
 
 **Farm tip:** keep wheat seeds in the double chest. After `collect wheat`, I'll put the harvest away and sow the field again.
 
-**Wood tip:** I need an axe — say `take axe` if I don't have one. A double chest beside the trees helps me stash as I work.
+**Wood tip:** I need an axe — say `take axe` if I don't have one. Keep **saplings** in the double chest (matching the tree type — spruce sapling for spruce, oak sapling for oak, etc.) so I can replant after a full chop.
 
 ---
 

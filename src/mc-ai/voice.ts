@@ -1,5 +1,6 @@
 import { VoiceListener } from "./stt";
 import { loadMcTtsConfig, speak, McTtsConfig } from "./tts";
+import { voiceWindowEnabled, voiceWindowUrl } from "./voice-window";
 
 export type McVoiceOptions = {
   enabled: boolean;
@@ -28,6 +29,9 @@ export class McVoice {
     if (!this.options.enabled || !this.options.sttEnabled) {
       if (this.options.ttsEnabled) {
         console.log(`[voice] Edge TTS: Ava Multilingual (${this.ttsConfig.voice})`);
+        if (voiceWindowEnabled()) {
+          console.log(`[voice] OBS window: ${voiceWindowUrl()} (Run Luna Voice.bat)`);
+        }
       }
       return;
     }

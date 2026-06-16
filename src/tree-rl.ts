@@ -179,8 +179,9 @@ export class TreeChopRL {
         t.placeJumpMs = Math.min(280, t.placeJumpMs + 18);
         t.placeSettleMs = Math.min(350, t.placeSettleMs + 12);
       } else {
-        t.mountJumpMs = Math.min(380, t.mountJumpMs + 22);
-        t.mountLandMs = Math.min(480, t.mountLandMs + 28);
+        t.mountJumpMs = Math.min(240, t.mountJumpMs + 12);
+        t.mountLandMs = Math.min(320, t.mountLandMs + 16);
+        t.placeJumpMs = Math.min(200, t.placeJumpMs + 10);
       }
       console.log(
         `[tree-rl] timing adjust (${kind} fail): ` +
@@ -218,6 +219,15 @@ export class TreeChopRL {
   }
 
   startSession(): TreeChopSession {
+    const t = (this.mem.climbTimings ??= { ...DEFAULT_TIMINGS });
+    if (t.mountJumpMs > 260 || t.mountLandMs > 360) {
+      t.mountJumpMs = DEFAULT_TIMINGS.mountJumpMs;
+      t.mountLandMs = DEFAULT_TIMINGS.mountLandMs;
+      t.placeJumpMs = DEFAULT_TIMINGS.placeJumpMs;
+      t.placeSettleMs = DEFAULT_TIMINGS.placeSettleMs;
+      saveMemory(this.mem);
+      console.log("[tree-rl] reset climb timings (were too slow from failed jumps)");
+    }
     return new TreeChopSession(this);
   }
 
