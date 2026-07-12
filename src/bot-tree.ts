@@ -10,10 +10,12 @@ import { replantTreeFromChest } from "./bot-tree-plant";
 import { isSleepRoutineActive } from "./bot-sleep";
 import {
   AXE_REACH_BLOCKS,
+  analyzeTreeCanopy,
   countLeavesNear,
   detectTree,
   DetectedTree,
   effectiveLogScanTopY,
+  findLogsViaLeafSupport,
   isLogBlockName,
   preferredStandColumn,
   SCAN_ABOVE_AXE_REACH,
@@ -1345,7 +1347,64 @@ function formatClimbGap(plan: TreeClimbGap): string {
 
 function scanChoppableLogs(bot: Bot, tree: DetectedTree, placedSteps: Vec3[]): Vec3[] {
   const skip = new Set(placedSteps.map(posKeyVec));
-  return scanTreeLogs(bot, tree).filter((p) => !skip.has(posKeyVec(p)));
+  const seen = new Set<string>();
+  const logs: Vec3[] = [];
+
+  const add = (p: Vec3) => {
+    const key = posKeyVec(p);
+    if (skip.has(key) || seen.has(key)) {
+      return;
+    }
+    const block = bot.blockAt(p);
+    if (!block || !isLogBlockName(block.name)) {
+      return;
+    }
+    seen.add(key);
+    logs.push(p.clone());
+  };
+
+  for (const p of scanTreeLogs(bot, tree)) {
+    add(p);
+  }
+  for (const p of findLogsViaLeafSupport(bot, tree)) {
+    add(p);
+  }
+
+  return logs.sort((a, b) => a.y - b.y || a.x - b.x || a.z - b.z);
+}
+
+/** When column scan is empty, use own vs foreign leaves to find remaining wood. */
+function resolveLogsFromCanopy(
+  bot: Bot,
+  tree: DetectedTree,
+  placedSteps: Vec3[]
+): { logs: Vec3[]; analysis: ReturnType<typeof analyzeTreeCanopy> } {
+  const analysis = analyzeTreeCanopy(bot, tree);
+  const skip = new Set(placedSteps.map(posKeyVec));
+  const logs = scanChoppableLogs(bot, tree, placedSteps);
+
+  if (logs.length > 0) {
+    return { logs, analysis };
+  }
+
+  const hinted = analysis.hintedLogPositions.filter((p) => !skip.has(posKeyVec(p)));
+  if (hinted.length > 0) {
+    console.log(
+      `[tree] canopy hunt: ${analysis.supportedHints.length} own leaf(s) still supported ` +
+        `(${analysis.foreignLeaves.length} foreign ignored) — ${hinted.length} log hint(s)`
+    );
+  } else if (analysis.supportedHints.length > 0) {
+    console.log(
+      `[tree] canopy: ${analysis.supportedHints.length} own leaf(s) still supported but no log found yet ` +
+        `(${analysis.foreignLeaves.length} foreign leaf blocks ignored)`
+    );
+  } else if (analysis.foreignLeaves.length > 0) {
+    console.log(
+      `[tree] canopy unsupported — ${analysis.foreignLeaves.length} leaf block(s) belong to neighboring tree(s)`
+    );
+  }
+
+  return { logs: hinted, analysis };
 }
 
 function isSnowFoliageBlock(block: Block | null): boolean {
@@ -1931,12 +1990,18 @@ export async function chopTreeAndStash(
     await equipToolCategory(bot, "axe");
     await centerOnColumn(bot, columnX, columnZ, session);
 
-    let liveLogs = scanChoppableLogs(bot, tree, placedSteps);
+    let { logs: liveLogs, analysis: canopy } = resolveLogsFromCanopy(bot, tree, placedSteps);
     if (liveLogs.length === 0) {
       await clearTrunkLeaves(bot, tree, 20, columnLock);
-      liveLogs = scanChoppableLogs(bot, tree, placedSteps);
+      ({ logs: liveLogs, analysis: canopy } = resolveLogsFromCanopy(bot, tree, placedSteps));
       if (liveLogs.length === 0) {
-        console.log("[tree] no trunk logs left in tree scan");
+        if (canopy.canopyUnsupported) {
+          console.log("[tree] no own logs left — canopy unsupported (neighbor leaves ignored)");
+        } else {
+          console.log(
+            `[tree] no logs found but ${canopy.supportedHints.length} own leaf(s) still supported — stopping`
+          );
+        }
         break;
       }
     }
@@ -1955,13 +2020,27 @@ export async function chopTreeAndStash(
       continue;
     }
 
-    const nextLogY = liveLogs[0]!.y;
-    if (await tryClimbSurfaceNearTrunk(bot, columnX, columnZ, session, nextLogY)) {
+    const huntTarget = liveLogs[0]!;
+    if (huntTarget.x !== columnX || huntTarget.z !== columnZ) {
+      const huntCol = pickTrunkPillarColumn(tree, huntTarget, bot);
+      if (huntCol.x !== columnX || huntCol.z !== columnZ) {
+        console.log(
+          `[tree] leaf-support hunt → log at (${huntTarget.x},${huntTarget.y},${huntTarget.z})`
+        );
+        await centerOnColumn(bot, huntTarget.x, huntTarget.z, session);
+      }
+    }
+
+    const nextLogY = huntTarget.y;
+    if (await tryClimbSurfaceNearTrunk(bot, huntTarget.x, huntTarget.z, session, nextLogY)) {
       climbStuckPasses = 0;
       continue;
     }
 
-    const leavesCleared = await clearTrunkLeaves(bot, tree, 24, columnLock);
+    const leavesCleared = await clearTrunkLeaves(bot, tree, 24, {
+      x: huntTarget.x,
+      z: huntTarget.z
+    });
     if (leavesCleared > 0) {
       const afterLeaves = liveLogs.filter((p) => canReachLog(bot, p)).sort((a, b) => a.y - b.y);
       if (afterLeaves.length > 0) {
@@ -1978,10 +2057,11 @@ export async function chopTreeAndStash(
 
     await lookStraightUp(bot, tree, session);
     const feetBefore = feetBlockY(bot);
+    const climbCol = pickTrunkPillarColumn(tree, huntTarget, bot);
     const stepped = await pillarOneStep(
       bot,
-      columnX,
-      columnZ,
+      climbCol.x,
+      climbCol.z,
       tree.logType,
       placedSteps,
       session,
@@ -1997,7 +2077,8 @@ export async function chopTreeAndStash(
     climbStuckPasses += 1;
     console.log(
       `[tree] cannot reach higher logs — feet y=${feetBlockY(bot)} ` +
-        `(dirt/cobble=${countScaffoldBlocks(bot)}, logs=${logCount(bot)})`
+        `(dirt/cobble=${countScaffoldBlocks(bot)}, logs=${logCount(bot)}, ` +
+        `ownLeavesSupported=${canopy.supportedHints.length})`
     );
     if (climbStuckPasses >= 4) {
       break;
@@ -2038,9 +2119,10 @@ export async function chopTreeAndStash(
     };
   }
 
+  const finalCanopy = analyzeTreeCanopy(bot, tree);
   const left = scanChoppableLogs(bot, tree, placedSteps).length;
   const leavesLeft = countLeavesNear(bot, tree);
-  const done = left === 0;
+  const done = left === 0 && finalCanopy.canopyUnsupported;
   const pts = session.points > 0 ? `; +${session.points} RL pts` : "";
 
   let planted = 0;
@@ -2055,9 +2137,13 @@ export async function chopTreeAndStash(
         : "";
   }
 
+  const foreignNote =
+    finalCanopy.foreignLeaves.length > 0
+      ? `, ${finalCanopy.foreignLeaves.length} neighbor leaf(s) ignored`
+      : "";
   const msg = done
-    ? `${tree.profile.label} tree done (${logsCut} logs, leaves decaying); stashed ${stashed}${planted > 0 ? `, planted ${planted} sapling(s)` : ""}${pts}${planted === 0 ? plantMsg : ""}`
-    : `${tree.profile.label}: cut ${logsCut} logs (${left} trunk left, ${leavesLeft} leaf blocks); stashed ${stashed}${pts}`;
+    ? `${tree.profile.label} tree done (${logsCut} logs, own canopy unsupported); stashed ${stashed}${planted > 0 ? `, planted ${planted} sapling(s)` : ""}${foreignNote}${pts}${planted === 0 ? plantMsg : ""}`
+    : `${tree.profile.label}: cut ${logsCut} logs (${left} trunk left, ${leavesLeft} own leaf blocks, ${finalCanopy.supportedHints.length} still supported${foreignNote}); stashed ${stashed}${pts}`;
 
   console.log(`[tree] ${msg}`);
   return {

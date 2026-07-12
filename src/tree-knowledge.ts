@@ -56,6 +56,42 @@ export type DetectedTree = {
   description: string;
 };
 
+/** Leaf ownership relative to the tree Luna is chopping. */
+export type LeafOwnership = "own" | "foreign" | "unknown";
+
+export type TreeLeafInfo = {
+  pos: Vec3;
+  distance: number;
+  persistent: boolean;
+  ownership: LeafOwnership;
+};
+
+/**
+ * Canopy analysis: which leaves belong to this grown tree vs a neighbor,
+ * and where remaining logs are still supporting our canopy.
+ */
+export type TreeCanopyAnalysis = {
+  ownLeaves: TreeLeafInfo[];
+  foreignLeaves: TreeLeafInfo[];
+  /** Non-persistent own leaves with distance &lt; 7 (still supported). */
+  supportedHints: TreeLeafInfo[];
+  /** Log positions next to distance-1 own leaves (hidden / off-column wood). */
+  hintedLogPositions: Vec3[];
+  /** True when no own leaves remain supported — trunk wood for this tree is gone. */
+  canopyUnsupported: boolean;
+};
+
+const FACE_OFFSETS: Vec3[] = [
+  new Vec3(1, 0, 0),
+  new Vec3(-1, 0, 0),
+  new Vec3(0, 1, 0),
+  new Vec3(0, -1, 0),
+  new Vec3(0, 0, 1),
+  new Vec3(0, 0, -1)
+];
+
+type BlockProps = { _properties?: Record<string, string | number | boolean> };
+
 const TREE_PROFILES: TreeProfile[] = [
   {
     id: "oak",
@@ -447,48 +483,465 @@ export function detectTree(bot: Bot, logBlock: Block): DetectedTree | null {
   };
 }
 
-export function scanTreeLogs(
-  bot: Bot,
-  tree: DetectedTree,
-  minY?: number
-): Vec3[] {
-  const anchor = tree.trunk;
-  const baseY = minY ?? anchor.y - 12;
-  const seen = new Set<string>();
-  const logs: Vec3[] = [];
-  const r = tree.scanRadius;
-  const topY = effectiveLogScanTopY(bot, tree);
-
-  for (let x = -r; x <= r; x++) {
-    for (let z = -r; z <= r; z++) {
-      if (new Vec3(x, 0, z).distanceTo(new Vec3(0, 0, 0)) > r) {
-        continue;
-      }
-      for (let y = baseY; y <= topY; y++) {
-        const block = bot.blockAt(new Vec3(anchor.x + x, y, anchor.z + z));
-        if (!block || !isLogBlockName(block.name) || !sameLogFamily(block.name, tree.logType)) {
-          continue;
-        }
-        const key = posKey(block.position);
-        if (seen.has(key)) {
-          continue;
-        }
-        seen.add(key);
-        logs.push(block.position.clone());
-      }
-    }
+/**
+ * How far logs may sit off the trunk columns — mirrors sapling growth envelopes
+ * (straight trunks stay on-column; fancy oak / jungle / cherry branch a little;
+ * acacia bends within scanRadius).
+ */
+export function growthLogOffset(tree: DetectedTree): number {
+  if (tree.trunkShape === "branching") {
+    return tree.scanRadius;
   }
-
-  return logs.sort((a, b) => a.y - b.y);
+  if (tree.trunkShape === "2x2" || tree.isGiant) {
+    return 1;
+  }
+  switch (tree.profile.id) {
+    case "oak":
+    case "jungle":
+    case "cherry":
+    case "mangrove":
+    case "azalea":
+      return Math.min(2, tree.scanRadius);
+    case "acacia":
+      return tree.scanRadius;
+    default:
+      return 0;
+  }
 }
 
-export function isTreeLeafBlock(block: Block, tree: DetectedTree): boolean {
+/** World Y band where this grown tree's wood/canopy can exist. */
+export function growthYBounds(bot: Bot, tree: DetectedTree): { minY: number; maxY: number } {
+  const top = effectiveLogScanTopY(bot, tree);
+  return {
+    minY: tree.trunk.y - (tree.profile.id === "mangrove" ? 6 : 2),
+    maxY: top
+  };
+}
+
+function nearestTrunkColumnDist(tree: DetectedTree, x: number, z: number): number {
+  const cols = tree.trunkColumns.length > 0 ? tree.trunkColumns : [tree.trunk];
+  let best = Infinity;
+  for (const col of cols) {
+    best = Math.min(best, Math.hypot(col.x - x, col.z - z));
+  }
+  return best;
+}
+
+function inGrowthEnvelope(bot: Bot, tree: DetectedTree, pos: Vec3): boolean {
+  const { minY, maxY } = growthYBounds(bot, tree);
+  if (pos.y < minY || pos.y > maxY) {
+    return false;
+  }
+  const horiz = nearestTrunkColumnDist(tree, pos.x, pos.z);
+  const maxHoriz = Math.max(tree.scanRadius, growthLogOffset(tree) + (tree.trunkShape === "2x2" ? 1 : 0));
+  return horiz <= maxHoriz + 0.01;
+}
+
+function isMatchingTreeLeaf(block: Block, tree: DetectedTree): boolean {
   if (!block || block.name === "air") {
     return false;
   }
   if (tree.profile.leafNames.includes(block.name)) {
     return true;
   }
+  if (tree.leafType && block.name === tree.leafType) {
+    return true;
+  }
+  // Species-matched leaves only — do not treat every *_leaves as ours.
+  return false;
+}
+
+export function getLeafDistance(block: Block | null): number {
+  if (!block) {
+    return 7;
+  }
+  const props = (block as Block & BlockProps)._properties;
+  if (props?.distance != null) {
+    const n = Number(props.distance);
+    return Number.isFinite(n) ? Math.max(1, Math.min(7, n)) : 7;
+  }
+  return 7;
+}
+
+export function isPersistentLeaf(block: Block | null): boolean {
+  if (!block) {
+    return false;
+  }
+  const props = (block as Block & BlockProps)._properties;
+  const p = props?.persistent;
+  return p === true || p === "true" || p === 1;
+}
+
+/**
+ * Logs that belong to this grown tree: same family inside the sapling growth
+ * envelope, on/near trunk columns, excluding neighbor trunks.
+ */
+export function scanTreeLogs(
+  bot: Bot,
+  tree: DetectedTree,
+  minY?: number
+): Vec3[] {
+  const { minY: envMin, maxY } = growthYBounds(bot, tree);
+  const baseY = minY ?? envMin;
+  const offset = growthLogOffset(tree);
+  const seen = new Set<string>();
+  const seeds: Vec3[] = [];
+
+  // Seed from trunk columns (survives mid-chop when upper wood is severed).
+  const columns = tree.trunkColumns.length > 0 ? tree.trunkColumns : [tree.trunk];
+  for (const col of columns) {
+    for (let y = baseY; y <= maxY; y++) {
+      const block = bot.blockAt(new Vec3(col.x, y, col.z));
+      if (!block || !isLogBlockName(block.name) || !sameLogFamily(block.name, tree.logType)) {
+        continue;
+      }
+      const key = posKey(block.position);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      seeds.push(block.position.clone());
+    }
+  }
+
+  // Off-column branch wood allowed by this species' growth pattern.
+  if (offset > 0) {
+    const r = Math.max(tree.scanRadius, offset);
+    for (let x = -r; x <= r; x++) {
+      for (let z = -r; z <= r; z++) {
+        for (let y = baseY; y <= maxY; y++) {
+          const pos = new Vec3(tree.trunk.x + x, y, tree.trunk.z + z);
+          if (nearestTrunkColumnDist(tree, pos.x, pos.z) > offset + 0.01) {
+            continue;
+          }
+          const block = bot.blockAt(pos);
+          if (!block || !isLogBlockName(block.name) || !sameLogFamily(block.name, tree.logType)) {
+            continue;
+          }
+          const key = posKey(block.position);
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          seeds.push(block.position.clone());
+        }
+      }
+    }
+  }
+
+  // Flood through face-adjacent logs so fancy/branch pieces stay one tree,
+  // but stop at the growth envelope so neighbor trunks are not absorbed.
+  const logs: Vec3[] = [];
+  const queue = [...seeds];
+  const owned = new Set(seeds.map(posKey));
+
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    logs.push(cur.clone());
+    for (const off of FACE_OFFSETS) {
+      const next = cur.plus(off);
+      const key = posKey(next);
+      if (owned.has(key) || !inGrowthEnvelope(bot, tree, next)) {
+        continue;
+      }
+      const block = bot.blockAt(next);
+      if (!block || !isLogBlockName(block.name) || !sameLogFamily(block.name, tree.logType)) {
+        continue;
+      }
+      // Reject neighbor trunks: ground-level log far from our columns.
+      if (
+        next.y <= tree.trunk.y + 1 &&
+        nearestTrunkColumnDist(tree, next.x, next.z) > Math.max(offset, tree.trunkShape === "2x2" ? 1.5 : 0.5)
+      ) {
+        continue;
+      }
+      owned.add(key);
+      queue.push(next.clone());
+    }
+  }
+
+  return logs.sort((a, b) => a.y - b.y || a.x - b.x || a.z - b.z);
+}
+
+/**
+ * Classify canopy leaves as own (grown from this sapling envelope / supported
+ * by our logs) vs foreign (neighbor tree). Uses leaf distance + log ownership.
+ */
+export function analyzeTreeCanopy(bot: Bot, tree: DetectedTree): TreeCanopyAnalysis {
+  const ownLogs = scanTreeLogs(bot, tree);
+  const ownLogKeys = new Set(ownLogs.map(posKey));
+  const { minY, maxY } = growthYBounds(bot, tree);
+  const r = tree.scanRadius + 2;
+
+  // Foreign same-family logs just outside our ownership (neighbor support).
+  const foreignLogKeys = new Set<string>();
+  for (let x = -r - 2; x <= r + 2; x++) {
+    for (let z = -r - 2; z <= r + 2; z++) {
+      for (let y = minY; y <= maxY; y++) {
+        const pos = new Vec3(tree.trunk.x + x, y, tree.trunk.z + z);
+        const key = posKey(pos);
+        if (ownLogKeys.has(key)) {
+          continue;
+        }
+        const block = bot.blockAt(pos);
+        if (!block || !isLogBlockName(block.name) || !sameLogFamily(block.name, tree.logType)) {
+          continue;
+        }
+        foreignLogKeys.add(key);
+      }
+    }
+  }
+
+  const ownReach = new Map<string, number>();
+  const ownQueue: { pos: Vec3; dist: number }[] = ownLogs.map((p) => ({ pos: p.clone(), dist: 0 }));
+  for (const p of ownLogs) {
+    ownReach.set(posKey(p), 0);
+  }
+
+  while (ownQueue.length > 0) {
+    const { pos, dist } = ownQueue.shift()!;
+    if (dist >= 7) {
+      continue;
+    }
+    for (const off of FACE_OFFSETS) {
+      const next = pos.plus(off);
+      const key = posKey(next);
+      const prev = ownReach.get(key);
+      if (prev !== undefined && prev <= dist + 1) {
+        continue;
+      }
+      const block = bot.blockAt(next);
+      if (!block || !isMatchingTreeLeaf(block, tree) || isPersistentLeaf(block)) {
+        continue;
+      }
+      if (!inGrowthEnvelope(bot, tree, next) && nearestTrunkColumnDist(tree, next.x, next.z) > r) {
+        continue;
+      }
+      ownReach.set(key, dist + 1);
+      ownQueue.push({ pos: next.clone(), dist: dist + 1 });
+    }
+  }
+
+  const foreignReach = new Map<string, number>();
+  const foreignQueue: { pos: Vec3; dist: number }[] = [];
+  for (const key of foreignLogKeys) {
+    const [x, y, z] = key.split(",").map(Number);
+    const pos = new Vec3(x!, y!, z!);
+    foreignReach.set(key, 0);
+    foreignQueue.push({ pos, dist: 0 });
+  }
+
+  while (foreignQueue.length > 0) {
+    const { pos, dist } = foreignQueue.shift()!;
+    if (dist >= 7) {
+      continue;
+    }
+    for (const off of FACE_OFFSETS) {
+      const next = pos.plus(off);
+      const key = posKey(next);
+      const prev = foreignReach.get(key);
+      if (prev !== undefined && prev <= dist + 1) {
+        continue;
+      }
+      const block = bot.blockAt(next);
+      if (!block || !isMatchingTreeLeaf(block, tree) || isPersistentLeaf(block)) {
+        continue;
+      }
+      foreignReach.set(key, dist + 1);
+      foreignQueue.push({ pos: next.clone(), dist: dist + 1 });
+    }
+  }
+
+  const ownLeaves: TreeLeafInfo[] = [];
+  const foreignLeaves: TreeLeafInfo[] = [];
+  const scanned = new Set<string>();
+
+  for (let x = -r; x <= r; x++) {
+    for (let z = -r; z <= r; z++) {
+      for (let y = minY; y <= maxY; y++) {
+        const pos = new Vec3(tree.trunk.x + x, y, tree.trunk.z + z);
+        const key = posKey(pos);
+        if (scanned.has(key)) {
+          continue;
+        }
+        const block = bot.blockAt(pos);
+        if (!block || !isMatchingTreeLeaf(block, tree)) {
+          continue;
+        }
+        scanned.add(key);
+        const persistent = isPersistentLeaf(block);
+        const distance = getLeafDistance(block);
+        const toOwn = ownReach.get(key);
+        const toForeign = foreignReach.get(key);
+
+        let ownership: LeafOwnership = "unknown";
+        if (persistent) {
+          ownership = "foreign";
+        } else if (toOwn !== undefined && (toForeign === undefined || toOwn <= toForeign)) {
+          ownership = "own";
+        } else if (toForeign !== undefined && (toOwn === undefined || toForeign < toOwn)) {
+          ownership = "foreign";
+        } else if (toOwn !== undefined) {
+          ownership = "own";
+        } else if (
+          inGrowthEnvelope(bot, tree, pos) &&
+          nearestTrunkColumnDist(tree, pos.x, pos.z) <= tree.scanRadius &&
+          ownLogs.length > 0
+        ) {
+          // Inside our growth blob but not leaf-connected yet — keep scanning.
+          ownership = "unknown";
+        } else {
+          // No own-log path (tree felled or neighbor-only support).
+          ownership = "foreign";
+        }
+
+        const info: TreeLeafInfo = {
+          pos: pos.clone(),
+          distance,
+          persistent,
+          ownership
+        };
+        if (ownership === "own") {
+          ownLeaves.push(info);
+        } else if (ownership === "foreign") {
+          foreignLeaves.push(info);
+        }
+      }
+    }
+  }
+
+  const supportedHints = ownLeaves
+    .filter((l) => !l.persistent && l.distance < 7)
+    .sort((a, b) => a.distance - b.distance || a.pos.y - b.pos.y);
+
+  const hintedLogPositions: Vec3[] = [];
+  const hintedKeys = new Set<string>();
+  for (const leaf of supportedHints) {
+    if (leaf.distance > 2) {
+      break;
+    }
+    for (const off of FACE_OFFSETS) {
+      const pos = leaf.pos.plus(off);
+      const key = posKey(pos);
+      if (hintedKeys.has(key) || ownLogKeys.has(key)) {
+        continue;
+      }
+      const block = bot.blockAt(pos);
+      if (!block || !isLogBlockName(block.name) || !sameLogFamily(block.name, tree.logType)) {
+        continue;
+      }
+      // Prefer wood still inside our growth envelope; skip clear neighbor trunks.
+      if (!inGrowthEnvelope(bot, tree, pos) && nearestTrunkColumnDist(tree, pos.x, pos.z) > growthLogOffset(tree) + 1) {
+        continue;
+      }
+      hintedKeys.add(key);
+      hintedLogPositions.push(pos.clone());
+    }
+  }
+
+  // Also surface own logs adjacent to low-distance leaves (already known).
+  for (const leaf of supportedHints.filter((l) => l.distance === 1).slice(0, 24)) {
+    for (const off of FACE_OFFSETS) {
+      const pos = leaf.pos.plus(off);
+      const key = posKey(pos);
+      if (hintedKeys.has(key)) {
+        continue;
+      }
+      if (!ownLogKeys.has(key)) {
+        continue;
+      }
+      hintedKeys.add(key);
+      hintedLogPositions.push(pos.clone());
+    }
+  }
+
+  hintedLogPositions.sort((a, b) => a.y - b.y || a.x - b.x || a.z - b.z);
+
+  return {
+    ownLeaves,
+    foreignLeaves,
+    supportedHints,
+    hintedLogPositions,
+    canopyUnsupported: supportedHints.length === 0
+  };
+}
+
+/** Find remaining logs via own-canopy leaf distance (Minecraft support graph). */
+export function findLogsViaLeafSupport(bot: Bot, tree: DetectedTree): Vec3[] {
+  const analysis = analyzeTreeCanopy(bot, tree);
+  const known = new Set(scanTreeLogs(bot, tree).map(posKey));
+  const found: Vec3[] = [];
+  const seen = new Set<string>();
+
+  for (const pos of analysis.hintedLogPositions) {
+    const key = posKey(pos);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    found.push(pos.clone());
+  }
+
+  // Walk from higher-distance own leaves toward lower-distance neighbors to
+  // uncover branch logs the column scan missed.
+  for (const leaf of analysis.supportedHints.slice(0, 40)) {
+    for (const off of FACE_OFFSETS) {
+      const next = leaf.pos.plus(off);
+      const block = bot.blockAt(next);
+      if (!block) {
+        continue;
+      }
+      if (isLogBlockName(block.name) && sameLogFamily(block.name, tree.logType)) {
+        const key = posKey(next);
+        if (!seen.has(key)) {
+          seen.add(key);
+          found.push(next.clone());
+        }
+        continue;
+      }
+      if (!isMatchingTreeLeaf(block, tree) || isPersistentLeaf(block)) {
+        continue;
+      }
+      if (getLeafDistance(block) >= leaf.distance) {
+        continue;
+      }
+      // Step toward support; check neighbors for logs.
+      for (const off2 of FACE_OFFSETS) {
+        const logPos = next.plus(off2);
+        const logBlock = bot.blockAt(logPos);
+        if (
+          !logBlock ||
+          !isLogBlockName(logBlock.name) ||
+          !sameLogFamily(logBlock.name, tree.logType)
+        ) {
+          continue;
+        }
+        const key = posKey(logPos);
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        found.push(logPos.clone());
+      }
+    }
+  }
+
+  // Prefer unknown/off-scan wood first, then known trunk logs.
+  return found.sort((a, b) => {
+    const aKnown = known.has(posKey(a)) ? 1 : 0;
+    const bKnown = known.has(posKey(b)) ? 1 : 0;
+    return aKnown - bKnown || a.y - b.y;
+  });
+}
+
+export function isTreeLeafBlock(block: Block, tree: DetectedTree): boolean {
+  if (!block || block.name === "air") {
+    return false;
+  }
+  if (isMatchingTreeLeaf(block, tree)) {
+    return true;
+  }
+  // Trunk clearing may still hit generic leaves jammed on the climb path.
   return block.name.endsWith("_leaves");
 }
 
@@ -537,26 +990,9 @@ export function scanTrunkLeaves(bot: Bot, tree: DetectedTree): Vec3[] {
   return leaves.sort((a, b) => a.y - b.y);
 }
 
+/** Count own (non-foreign) canopy leaves still present. */
 export function countLeavesNear(bot: Bot, tree: DetectedTree): number {
-  const anchor = tree.trunk;
-  let count = 0;
-  const r = tree.scanRadius + 1;
-  const maxY = effectiveLogScanTopY(bot, tree) - anchor.y;
-
-  for (let x = -r; x <= r; x++) {
-    for (let y = 0; y <= maxY; y++) {
-      for (let z = -r; z <= r; z++) {
-        const block = bot.blockAt(anchor.offset(x, y, z));
-        if (!block || block.name === "air") {
-          continue;
-        }
-        if (tree.profile.leafNames.includes(block.name)) {
-          count += 1;
-        }
-      }
-    }
-  }
-  return count;
+  return analyzeTreeCanopy(bot, tree).ownLeaves.length;
 }
 
 export function preferredStandColumn(tree: DetectedTree): Vec3 {
